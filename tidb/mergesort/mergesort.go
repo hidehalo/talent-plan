@@ -26,43 +26,14 @@ func MergeSort(src []int64) {
 			MergeSort(src[middle:])
 
 			wg.Wait()
-			merge(src, middle)
+			merge(src[:middle], src[middle:])
 		}
 	}
 }
 
-func merge(src []int64, middle int, maxele int64) {
-	size := len(src)
-	i := 0
-	j := middle + 1
-	k := 0
+func merge(left []int64, right []int64) {
 	
-    for i <= middle && j < size {
-        if (src[i] % maxele <= src[j] % maxele) { 
-            src[k] = src[k] + (src[i] % maxele) * maxele; 
-            k++; 
-            i++; 
-        } else { 
-            src[k] = src[k] + (src[j] % maxele) * maxele; 
-            k++; 
-            j++; 
-        } 
-    } 
-    for i <= middle { 
-        src[k] = src[k] + (src[i] % maxele) * maxele; 
-        k++; 
-        i++; 
-    } 
-    for j < size { 
-        src[k] = src[k] + (src[j] % maxele) * maxele; 
-        k++; 
-        j++; 
-    } 
-  
-    // Obtaining actual values 
-    for i := 0; i < size; i++ {
-        src[i] = src[i] / maxele; 
-	}
+
 }
 
 
@@ -71,6 +42,6 @@ func mergesort(src []int64) {
 		middle := len(src) / 2
 		mergesort(src[:middle])
 		mergesort(src[middle:])
-		merge(src, middle)
+		merge(src[:middle], src[middle:])
 	}
 }
