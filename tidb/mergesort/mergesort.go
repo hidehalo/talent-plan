@@ -16,7 +16,6 @@ var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
 
 // MergeSort performs the merge sort algorithm.
 // Please supplement this function to accomplish the home work.
-
 func MergeSort(src []int64) {
 	len := len(src)
 	if len > 1 {
@@ -38,7 +37,7 @@ func MergeSort(src []int64) {
 			MergeSort(src[middle:])
 
 			wg.Wait()
-			copyi64arr(src, merge(src[:middle], src[middle:]))
+			copy(src, merge(src[:middle], src[middle:]))
 		}
 	}
 }
@@ -72,17 +71,11 @@ func mergesort(src []int64) {
 		middle := len(src) / 2
 		mergesort(src[:middle])
 		mergesort(src[middle:])
-		copyi64arr(src, merge(src[:middle], src[middle:]))
+		copy(src, merge(src[:middle], src[middle:]))
 	}
 }
 
-func copyi64arr(a []int64, b []int64) {
-	for i, v := range b {
-		a[i] = v
-	}
-}
-
-func prepare(src []int64) {
+func internalPrepare(src []int64) {
 	rand.Seed(time.Now().Unix())
 	for i := range src {
 		src[i] = rand.Int63()
@@ -115,6 +108,6 @@ func main() {
 		}
 	}
 	src := make([]int64, 1<<20)
-	prepare(src)
+	internalPrepare(src)
 	MergeSort(src)
 }
