@@ -120,7 +120,7 @@ func main() {
 			panic(err)
 		}
 		defer f.Close()
-
+		runtime.GC()
 		err = trace.Start(f)
 		if err != nil {
 			panic(err)
