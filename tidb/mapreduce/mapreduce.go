@@ -108,8 +108,37 @@ func (c *MRCluster) worker() {
 					SafeClose(fs[i], bs[i])
 				}
 			} else {
-				// YOUR CODE HERE :)
-				panic("YOUR CODE HERE")
+				// TODO: impl&testing
+				fs := make([]*os.File, t.nReduce)
+				bs := make([]*bufio.Reader, t.nReduce)
+				kvpairs := make(map[string][]string)
+				for i := range fs {
+					rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
+					fs[i], bs[i] = OpenFileAndBuf(rpath)
+					dec := json.NewDecoder(bs[i])
+					for dec.More() {
+						var kv KeyValue
+						err := dec.Decode(&kv)
+						if err != nil {
+							continue
+						}
+						if _,ok := kvpairs[kv.Key];ok != true {
+							kvpairs[kv.Key] = make([]string, 0, 1000)
+						}
+						kvpairs[kv.Key] = append(kvpairs[kv.Key], kv.Value)
+					}
+				}
+				mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.nReduce))
+				menc := json.NewEncoder(mfb)
+				for key,vals := range kvpairs {
+					result := t.reduceF(key, vals)
+					// TODO: write result to merge file
+					err := menc.Encode(KeyValue{key, result})
+					if err != nil {
+
+					}
+				}
+				SafeClose(mf, mfb)
 			}
 			t.wg.Done()
 		case <-c.exit:
@@ -155,8 +184,27 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 	}
 
 	// reduce phase
-	// YOUR CODE HERE :D
-	panic("YOUR CODE HERE")
+	// TODO: impl&testing
+	rtasks := make([]*task, 0, nReduce)
+	for i := 0; i < nReduce; i++ {
+		t := &task{
+			dataDir:    dataDir,
+			jobName:    jobName,
+			phase:      reducePhase,
+			taskNumber: i,
+			nReduce:    nReduce,
+			nMap:       nMap,
+			reduceF:    reduceF,
+		}
+		t.wg.Add(1)
+		tasks = append(rtasks, t)
+		go func() { c.taskCh <- t }()
+	}
+	for _, t := range rtasks {
+		t.wg.Wait()
+	}
+
+	c.exit <- *new(struct{})
 }
 
 func ihash(s string) int {
