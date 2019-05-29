@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"fmt"
 )
 
 // KeyValue is a type used to hold the key/value pairs passed to the map and reduce functions.
@@ -135,7 +136,7 @@ func (c *MRCluster) worker() {
 					// TODO: write result to merge file
 					err := menc.Encode(KeyValue{key, result})
 					if err != nil {
-
+						log.Fatalln(err)
 					}
 				}
 				SafeClose(mf, mfb)
@@ -161,6 +162,7 @@ func (c *MRCluster) Submit(jobName, dataDir string, mapF MapF, reduceF ReduceF, 
 }
 
 func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, mapFiles []string, nReduce int, notify chan<- []string) {
+	fmt.Println("Map phase")
 	// map phase
 	nMap := len(mapFiles)
 	tasks := make([]*task, 0, nMap)
@@ -182,7 +184,7 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 	for _, t := range tasks {
 		t.wg.Wait()
 	}
-
+	fmt.Println("Reduce phase")
 	// reduce phase
 	// TODO: impl&testing
 	rtasks := make([]*task, 0, nReduce)
@@ -197,12 +199,17 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 			reduceF:    reduceF,
 		}
 		t.wg.Add(1)
-		tasks = append(rtasks, t)
+		rtasks = append(rtasks, t)
 		go func() { c.taskCh <- t }()
 	}
+
+	// mfs := make([]string,0,1000)
 	for _, t := range rtasks {
 		t.wg.Wait()
+		// mfs = append(mfs, mergeName(t.dataDir, t.jobName, t.taskNumber))
 	}
+
+	notify <- mapFiles
 
 	c.exit <- *new(struct{})
 }
