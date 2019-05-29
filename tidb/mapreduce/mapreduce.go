@@ -12,7 +12,15 @@ import (
 	"strconv"
 	"sync"
 	"fmt"
+	"strings"
+	"sort"
 )
+// ByKey order KeyValue set ASC
+type ByKey []KeyValue
+
+func (kv ByKey) Len() int           { return len(kv) }
+func (kv ByKey) Swap(i, j int)      { kv[i], kv[j] = kv[j], kv[i] }
+func (kv ByKey) Less(i, j int) bool { return strings.Compare(kv[i].Key, kv[j].Key) == -1 }
 
 // KeyValue is a type used to hold the key/value pairs passed to the map and reduce functions.
 type KeyValue struct {
@@ -110,34 +118,38 @@ func (c *MRCluster) worker() {
 				}
 			} else {
 				// TODO: impl&testing
-				fs := make([]*os.File, t.nReduce)
-				bs := make([]*bufio.Reader, t.nReduce)
-				kvpairs := make(map[string][]string)
+				fs := make([]*os.File, t.nMap)
+				bs := make([]*bufio.Reader, t.nMap)
+				kvs := make([]KeyValue, 0, 1000)
+				groupByKey := make(map[string][]string)
+
 				for i := range fs {
-					rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
+					rpath := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
 					fs[i], bs[i] = OpenFileAndBuf(rpath)
 					dec := json.NewDecoder(bs[i])
 					for dec.More() {
 						var kv KeyValue
 						err := dec.Decode(&kv)
 						if err != nil {
-							continue
+							break
 						}
-						if _,ok := kvpairs[kv.Key];ok != true {
-							kvpairs[kv.Key] = make([]string, 0, 1000)
-						}
-						kvpairs[kv.Key] = append(kvpairs[kv.Key], kv.Value)
+						kvs = append(kvs, kv)
 					}
 				}
-				mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
-				menc := json.NewEncoder(mfb)
-				for key,vals := range kvpairs {
-					result := t.reduceF(key, vals)
-					// TODO: write result to merge file
-					err := menc.Encode(KeyValue{key, result})
-					if err != nil {
-						log.Fatalln(err)
+
+				sort.Sort(ByKey(kvs))
+
+				for _,kv := range kvs {
+					if _,ok := groupByKey[kv.Key];ok != true {
+						groupByKey[kv.Key] = make([]string, 0, 1000)
 					}
+					fmt.Println("Key:", kv.Key, "Val:", kv.Value)
+					groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
+				}
+
+				mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
+				for key,vals := range groupByKey {
+					fmt.Fprintf(mfb, "%s", t.reduceF(key, vals))
 				}
 				SafeClose(mf, mfb)
 			}
@@ -203,10 +215,13 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		go func() { c.taskCh <- t }()
 	}
 
-	mfs := make([]string,0,1000)
+	mfs := make([]string, 0, 1000)
 	for _, t := range rtasks {
 		t.wg.Wait()
-		mfs = append(mfs, mergeName(t.dataDir, t.jobName, t.taskNumber))
+		mf := mergeName(t.dataDir, t.jobName, t.taskNumber)
+		if FileOrDirExist(mf) {
+			mfs = append(mfs, mf)
+		}
 	}
 
 	notify <- mfs
