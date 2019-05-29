@@ -129,7 +129,7 @@ func (c *MRCluster) worker() {
 						kvpairs[kv.Key] = append(kvpairs[kv.Key], kv.Value)
 					}
 				}
-				mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.nReduce))
+				mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
 				menc := json.NewEncoder(mfb)
 				for key,vals := range kvpairs {
 					result := t.reduceF(key, vals)
@@ -203,13 +203,13 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		go func() { c.taskCh <- t }()
 	}
 
-	// mfs := make([]string,0,1000)
+	mfs := make([]string,0,1000)
 	for _, t := range rtasks {
 		t.wg.Wait()
-		// mfs = append(mfs, mergeName(t.dataDir, t.jobName, t.taskNumber))
+		mfs = append(mfs, mergeName(t.dataDir, t.jobName, t.taskNumber))
 	}
 
-	notify <- mapFiles
+	notify <- mfs
 
 	c.exit <- *new(struct{})
 }
