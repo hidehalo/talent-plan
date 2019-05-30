@@ -95,7 +95,6 @@ func (c *MRCluster) worker() {
 		select {
 		case t := <-c.taskCh:
 			if t.phase == mapPhase {
-				fmt.Println("Do map phase job")
 				content, err := ioutil.ReadFile(t.mapFile)
 				if err != nil {
 					panic(err)
@@ -118,8 +117,7 @@ func (c *MRCluster) worker() {
 					SafeClose(fs[i], bs[i])
 				}
 			} else {
-				fmt.Println("Do reduce phase job")
-				// TODO: impl&testing
+				// TODO: benchmark
 				fs := make([]*os.File, t.nMap)
 				bs := make([]*bufio.Reader, t.nMap)
 				kvs := make([]KeyValue, 0, 1000)
@@ -197,7 +195,7 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		t.wg.Wait()
 	}
 	// reduce phase
-	// TODO: impl&testing
+	// TODO: benchmark
 	rtasks := make([]*task, 0, nReduce)
 	for i := 0; i < nReduce; i++ {
 		t := &task{
@@ -224,8 +222,6 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 	}
 
 	notify <- mfs
-
-	c.exit <- *new(struct{})
 }
 
 func ihash(s string) int {
