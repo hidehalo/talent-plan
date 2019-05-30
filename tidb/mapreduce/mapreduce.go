@@ -95,6 +95,7 @@ func (c *MRCluster) worker() {
 		select {
 		case t := <-c.taskCh:
 			if t.phase == mapPhase {
+				fmt.Println("Do map phase job")
 				content, err := ioutil.ReadFile(t.mapFile)
 				if err != nil {
 					panic(err)
@@ -117,6 +118,7 @@ func (c *MRCluster) worker() {
 					SafeClose(fs[i], bs[i])
 				}
 			} else {
+				fmt.Println("Do reduce phase job")
 				// TODO: impl&testing
 				fs := make([]*os.File, t.nMap)
 				bs := make([]*bufio.Reader, t.nMap)
@@ -143,7 +145,6 @@ func (c *MRCluster) worker() {
 					if _,ok := groupByKey[kv.Key];ok != true {
 						groupByKey[kv.Key] = make([]string, 0, 1000)
 					}
-					fmt.Println("Key:", kv.Key, "Val:", kv.Value)
 					groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
 				}
 
@@ -174,7 +175,6 @@ func (c *MRCluster) Submit(jobName, dataDir string, mapF MapF, reduceF ReduceF, 
 }
 
 func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, mapFiles []string, nReduce int, notify chan<- []string) {
-	fmt.Println("Map phase")
 	// map phase
 	nMap := len(mapFiles)
 	tasks := make([]*task, 0, nMap)
@@ -196,7 +196,6 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 	for _, t := range tasks {
 		t.wg.Wait()
 	}
-	fmt.Println("Reduce phase")
 	// reduce phase
 	// TODO: impl&testing
 	rtasks := make([]*task, 0, nReduce)
