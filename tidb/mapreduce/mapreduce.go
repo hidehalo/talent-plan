@@ -94,6 +94,7 @@ func (c *MRCluster) worker() {
 	for {
 		select {
 		case t := <-c.taskCh:
+			// 缺少容错机制
 			if t.phase == mapPhase {
 				content, err := ioutil.ReadFile(t.mapFile)
 				if err != nil {
