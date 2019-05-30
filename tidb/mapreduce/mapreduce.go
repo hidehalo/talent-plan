@@ -99,7 +99,6 @@ func (c *MRCluster) worker() {
 				if err != nil {
 					panic(err)
 				}
-
 				fs := make([]*os.File, t.nReduce)
 				bs := make([]*bufio.Writer, t.nReduce)
 				for i := range fs {
