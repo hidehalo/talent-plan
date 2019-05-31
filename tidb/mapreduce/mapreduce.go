@@ -12,15 +12,15 @@ import (
 	"strconv"
 	"sync"
 	"fmt"
-	"strings"
-	"sort"
+	// "strings"
+	// "sort"
 )
 // ByKey order KeyValue set ASC
-type ByKey []KeyValue
+// type ByKey []KeyValue
 
-func (kv ByKey) Len() int           { return len(kv) }
-func (kv ByKey) Swap(i, j int)      { kv[i], kv[j] = kv[j], kv[i] }
-func (kv ByKey) Less(i, j int) bool { return strings.Compare(kv[i].Key, kv[j].Key) == -1 }
+// func (kv ByKey) Len() int           { return len(kv) }
+// func (kv ByKey) Swap(i, j int)      { kv[i], kv[j] = kv[j], kv[i] }
+// func (kv ByKey) Less(i, j int) bool { return strings.Compare(kv[i].Key, kv[j].Key) == -1 }
 
 // KeyValue is a type used to hold the key/value pairs passed to the map and reduce functions.
 type KeyValue struct {
@@ -91,68 +91,83 @@ func (c *MRCluster) Start() {
 
 func (c *MRCluster) worker() {
 	defer c.wg.Done()
-	for {
-		select {
-		case t := <-c.taskCh:
-			// 缺少容错机制
-			if t.phase == mapPhase {
-				content, err := ioutil.ReadFile(t.mapFile)
-				if err != nil {
-					panic(err)
+	queued := 0
+	doJob := func (t *task) {
+		if t.phase == mapPhase {
+			content, err := ioutil.ReadFile(t.mapFile)
+			if err != nil {
+				panic(err)
+			}
+			fs := make([]*os.File, t.nReduce)
+			bs := make([]*bufio.Writer, t.nReduce)
+			for i := range fs {
+				rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
+				fs[i], bs[i] = CreateFileAndBuf(rpath)
+			}
+			results := t.mapF(t.mapFile, string(content))
+			for _, kv := range results {
+				enc := json.NewEncoder(bs[ihash(kv.Key)%t.nReduce])
+				if err := enc.Encode(&kv); err != nil {
+					log.Fatalln(err)
 				}
-				fs := make([]*os.File, t.nReduce)
-				bs := make([]*bufio.Writer, t.nReduce)
-				for i := range fs {
-					rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
-					fs[i], bs[i] = CreateFileAndBuf(rpath)
-				}
-				results := t.mapF(t.mapFile, string(content))
-				for _, kv := range results {
-					enc := json.NewEncoder(bs[ihash(kv.Key)%t.nReduce])
-					if err := enc.Encode(&kv); err != nil {
+			}
+			for i := range fs {
+				SafeClose(fs[i], bs[i])
+			}
+		} else {
+			fs := make([]*os.File, t.nMap)
+			bs := make([]*bufio.Reader, t.nMap)
+			// kvs := make([]KeyValue, 0, 1000)
+			groupByKey := make(map[string][]string)
+
+			for i := range fs {
+				rpath := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
+				fs[i], bs[i] = OpenFileAndBuf(rpath)
+				dec := json.NewDecoder(bs[i])
+				for dec.More() {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
 						log.Fatalln(err)
 					}
-				}
-				for i := range fs {
-					SafeClose(fs[i], bs[i])
-				}
-			} else {
-				// TODO: benchmark
-				fs := make([]*os.File, t.nMap)
-				bs := make([]*bufio.Reader, t.nMap)
-				kvs := make([]KeyValue, 0, 1000)
-				groupByKey := make(map[string][]string)
-
-				for i := range fs {
-					rpath := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
-					fs[i], bs[i] = OpenFileAndBuf(rpath)
-					dec := json.NewDecoder(bs[i])
-					for dec.More() {
-						var kv KeyValue
-						err := dec.Decode(&kv)
-						if err != nil {
-							break
-						}
-						kvs = append(kvs, kv)
-					}
-				}
-
-				sort.Sort(ByKey(kvs))
-
-				for _,kv := range kvs {
 					if _,ok := groupByKey[kv.Key];ok != true {
 						groupByKey[kv.Key] = make([]string, 0, 1000)
 					}
 					groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
+					// kvs = append(kvs, kv)
 				}
-
-				mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
-				for key,vals := range groupByKey {
-					fmt.Fprintf(mfb, "%s", t.reduceF(key, vals))
-				}
-				SafeClose(mf, mfb)
 			}
-			t.wg.Done()
+
+			// sort.Sort(ByKey(kvs))
+
+			// for _,kv := range kvs {
+			// 	if _,ok := groupByKey[kv.Key];ok != true {
+			// 		groupByKey[kv.Key] = make([]string, 0, 1000)
+			// 	}
+			// 	groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
+			// }
+
+			mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
+			for key,vals := range groupByKey {
+				fmt.Fprintf(mfb, "%s", t.reduceF(key, vals))
+			}
+			SafeClose(mf, mfb)
+		}
+		t.wg.Done()
+	}
+	for {
+		select {
+		case t := <-c.taskCh:
+			queued++
+			fmt.Println("queued", queued)
+			if queued >= 16 {
+				doJob(t)
+				queued--
+			} else {
+				go func() {
+					doJob(t)
+					queued--
+				}()
+			}
 		case <-c.exit:
 			return
 		}
@@ -195,8 +210,9 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		t.wg.Wait()
 	}
 	// reduce phase
-	// TODO: benchmark
 	rtasks := make([]*task, 0, nReduce)
+	mfs := make([]string, 0, nReduce)
+
 	for i := 0; i < nReduce; i++ {
 		t := &task{
 			dataDir:    dataDir,
@@ -212,13 +228,10 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		go func() { c.taskCh <- t }()
 	}
 
-	mfs := make([]string, 0, 1000)
 	for _, t := range rtasks {
-		t.wg.Wait()
 		mf := mergeName(t.dataDir, t.jobName, t.taskNumber)
-		if FileOrDirExist(mf) {
-			mfs = append(mfs, mf)
-		}
+		mfs = append(mfs, mf)
+		t.wg.Wait()
 	}
 
 	notify <- mfs
