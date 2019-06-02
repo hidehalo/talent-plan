@@ -3,7 +3,10 @@
 all: test_example test_homework cleanup gendata
 
 test_example:
-	go test --trace=trace.out -v -run=TestExampleURLTop
+	go test -v -run=TestExampleURLTop
+
+pprof_test_example:
+	go test -timeout=30m --trace=trace.out --cpuprofile=cpu.out --blockprofile=block.out -v -run=TestExampleURLTop
 
 test_homework:
 	go test -v -run=TestURLTop

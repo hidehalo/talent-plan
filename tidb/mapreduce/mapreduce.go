@@ -91,82 +91,68 @@ func (c *MRCluster) Start() {
 
 func (c *MRCluster) worker() {
 	defer c.wg.Done()
-	queued := 0
-	doJob := func (t *task) {
-		if t.phase == mapPhase {
-			content, err := ioutil.ReadFile(t.mapFile)
-			if err != nil {
-				panic(err)
-			}
-			fs := make([]*os.File, t.nReduce)
-			bs := make([]*bufio.Writer, t.nReduce)
-			for i := range fs {
-				rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
-				fs[i], bs[i] = CreateFileAndBuf(rpath)
-			}
-			results := t.mapF(t.mapFile, string(content))
-			for _, kv := range results {
-				enc := json.NewEncoder(bs[ihash(kv.Key)%t.nReduce])
-				if err := enc.Encode(&kv); err != nil {
+
+	doReduce := func (t *task) {
+		fs := make([]*os.File, t.nMap)
+		bs := make([]*bufio.Reader, t.nMap)
+		groupByKey := make(map[string][]string)
+
+		var kv KeyValue
+
+		for i := range fs {
+			rpath := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
+			fs[i], bs[i] = OpenFileAndBuf(rpath)
+			dec := json.NewDecoder(bs[i])
+			for dec.More() {
+				if err := dec.Decode(&kv); err != nil {
 					log.Fatalln(err)
 				}
-			}
-			for i := range fs {
-				SafeClose(fs[i], bs[i])
-			}
-		} else {
-			fs := make([]*os.File, t.nMap)
-			bs := make([]*bufio.Reader, t.nMap)
-			// kvs := make([]KeyValue, 0, 1000)
-			groupByKey := make(map[string][]string)
-
-			for i := range fs {
-				rpath := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
-				fs[i], bs[i] = OpenFileAndBuf(rpath)
-				dec := json.NewDecoder(bs[i])
-				for dec.More() {
-					var kv KeyValue
-					if err := dec.Decode(&kv); err != nil {
-						log.Fatalln(err)
-					}
-					if _,ok := groupByKey[kv.Key];ok != true {
-						groupByKey[kv.Key] = make([]string, 0, 1000)
-					}
-					groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
-					// kvs = append(kvs, kv)
+				if _,ok := groupByKey[kv.Key];ok != true {
+					groupByKey[kv.Key] = make([]string, 0, 1000)
 				}
+				groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
 			}
+		}
 
-			// sort.Sort(ByKey(kvs))
+		mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
+		for key,vals := range groupByKey {
+			fmt.Fprintf(mfb, "%s", t.reduceF(key, vals))
+		}
+		SafeClose(mf, mfb)
+		t.wg.Done()
+	}
 
-			// for _,kv := range kvs {
-			// 	if _,ok := groupByKey[kv.Key];ok != true {
-			// 		groupByKey[kv.Key] = make([]string, 0, 1000)
-			// 	}
-			// 	groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
-			// }
-
-			mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
-			for key,vals := range groupByKey {
-				fmt.Fprintf(mfb, "%s", t.reduceF(key, vals))
+	doMap := func (t *task) {
+		content, err := ioutil.ReadFile(t.mapFile)
+		if err != nil {
+			panic(err)
+		}
+		fs := make([]*os.File, t.nReduce)
+		bs := make([]*bufio.Writer, t.nReduce)
+		for i := range fs {
+			rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
+			fs[i], bs[i] = CreateFileAndBuf(rpath)
+		}
+		results := t.mapF(t.mapFile, string(content))
+		for _, kv := range results {
+			enc := json.NewEncoder(bs[ihash(kv.Key)%t.nReduce])
+			if err := enc.Encode(&kv); err != nil {
+				log.Fatalln(err)
 			}
-			SafeClose(mf, mfb)
+		}
+		for i := range fs {
+			SafeClose(fs[i], bs[i])
 		}
 		t.wg.Done()
 	}
+
 	for {
 		select {
 		case t := <-c.taskCh:
-			queued++
-			fmt.Println("queued", queued)
-			if queued >= 16 {
-				doJob(t)
-				queued--
+			if t.phase == mapPhase {
+				go doMap(t)
 			} else {
-				go func() {
-					doJob(t)
-					queued--
-				}()
+				go doReduce(t)
 			}
 		case <-c.exit:
 			return
@@ -191,6 +177,7 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 	// map phase
 	nMap := len(mapFiles)
 	tasks := make([]*task, 0, nMap)
+
 	for i := 0; i < nMap; i++ {
 		t := &task{
 			dataDir:    dataDir,
@@ -204,8 +191,11 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		}
 		t.wg.Add(1)
 		tasks = append(tasks, t)
-		go func() { c.taskCh <- t }()
+		go func () {
+			c.taskCh <- t
+		}()
 	}
+
 	for _, t := range tasks {
 		t.wg.Wait()
 	}
@@ -225,7 +215,9 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		}
 		t.wg.Add(1)
 		rtasks = append(rtasks, t)
-		go func() { c.taskCh <- t }()
+		go func () {
+			c.taskCh <- t
+		}()
 	}
 
 	for _, t := range rtasks {
