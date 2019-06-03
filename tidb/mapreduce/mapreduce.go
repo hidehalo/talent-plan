@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"log"
@@ -11,10 +13,10 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
-	"fmt"
 	// "strings"
 	// "sort"
 )
+
 // ByKey order KeyValue set ASC
 // type ByKey []KeyValue
 
@@ -92,37 +94,39 @@ func (c *MRCluster) Start() {
 func (c *MRCluster) worker() {
 	defer c.wg.Done()
 
-	doReduce := func (t *task) {
-		fs := make([]*os.File, t.nMap)
-		bs := make([]*bufio.Reader, t.nMap)
+	doReduce := func(t *task) {
 		groupByKey := make(map[string][]string)
 
 		var kv KeyValue
 
-		for i := range fs {
+		for i := 0; i < t.nMap; i++ {
 			rpath := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
-			fs[i], bs[i] = OpenFileAndBuf(rpath)
-			dec := json.NewDecoder(bs[i])
+			content, err := ioutil.ReadFile(rpath)
+			if err != nil {
+				panic(err)
+			}
+			rd := bytes.NewReader(content)
+			dec := json.NewDecoder(rd)
 			for dec.More() {
 				if err := dec.Decode(&kv); err != nil {
 					log.Fatalln(err)
 				}
-				if _,ok := groupByKey[kv.Key];ok != true {
+				if _, ok := groupByKey[kv.Key]; ok != true {
 					groupByKey[kv.Key] = make([]string, 0, 1000)
 				}
 				groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
 			}
 		}
 
-		mf,mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
-		for key,vals := range groupByKey {
+		mf, mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
+		for key, vals := range groupByKey {
 			fmt.Fprintf(mfb, "%s", t.reduceF(key, vals))
 		}
 		SafeClose(mf, mfb)
 		t.wg.Done()
 	}
 
-	doMap := func (t *task) {
+	doMap := func(t *task) {
 		content, err := ioutil.ReadFile(t.mapFile)
 		if err != nil {
 			panic(err)
@@ -191,7 +195,7 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		}
 		t.wg.Add(1)
 		tasks = append(tasks, t)
-		go func () {
+		go func() {
 			c.taskCh <- t
 		}()
 	}
@@ -215,7 +219,7 @@ func (c *MRCluster) run(jobName, dataDir string, mapF MapF, reduceF ReduceF, map
 		}
 		t.wg.Add(1)
 		rtasks = append(rtasks, t)
-		go func () {
+		go func() {
 			c.taskCh <- t
 		}()
 	}
