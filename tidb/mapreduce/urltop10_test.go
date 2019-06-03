@@ -12,7 +12,7 @@ import (
 
 func testDataScale() ([]DataSize, []int) {
 	// dataSize := []DataSize{1 * KB, 1 * MB, 10 * MB, 100 * MB, 1 * GB}
-	dataSize := []DataSize{200 * MB}
+	dataSize := []DataSize{100 * MB}
 	// nMapFiles := []int{5, 10, 20, 40, 60}
 	nMapFiles := []int{40}
 	return dataSize, nMapFiles

@@ -11,18 +11,18 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
-	// "strings"
-	// "sort"
 )
 
 // ByKey order KeyValue set ASC
-// type ByKey []KeyValue
+type ByKey []KeyValue
 
-// func (kv ByKey) Len() int           { return len(kv) }
-// func (kv ByKey) Swap(i, j int)      { kv[i], kv[j] = kv[j], kv[i] }
-// func (kv ByKey) Less(i, j int) bool { return strings.Compare(kv[i].Key, kv[j].Key) == -1 }
+func (kv ByKey) Len() int           { return len(kv) }
+func (kv ByKey) Swap(i, j int)      { kv[i], kv[j] = kv[j], kv[i] }
+func (kv ByKey) Less(i, j int) bool { return strings.Compare(kv[i].Key, kv[j].Key) == -1 }
 
 // KeyValue is a type used to hold the key/value pairs passed to the map and reduce functions.
 type KeyValue struct {
@@ -95,8 +95,7 @@ func (c *MRCluster) worker() {
 	defer c.wg.Done()
 
 	doReduce := func(t *task) {
-		groupByKey := make(map[string][]string)
-
+		kvs := make([]KeyValue, 0, 10000)
 		var kv KeyValue
 
 		for i := 0; i < t.nMap; i++ {
@@ -111,17 +110,29 @@ func (c *MRCluster) worker() {
 				if err := dec.Decode(&kv); err != nil {
 					log.Fatalln(err)
 				}
-				if _, ok := groupByKey[kv.Key]; ok != true {
-					groupByKey[kv.Key] = make([]string, 0, 1000)
-				}
-				groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
+				kvs = append(kvs, kv)
 			}
 		}
 
+		sort.Sort(ByKey(kvs))
+
 		mf, mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
-		for key, vals := range groupByKey {
-			fmt.Fprintf(mfb, "%s", t.reduceF(key, vals))
+
+		var currentKey string
+		var currentVals []string
+
+		for i, kv := range kvs {
+			if currentKey != kv.Key {
+				if i > 0 {
+					fmt.Fprintf(mfb, "%s", t.reduceF(currentKey, currentVals))
+				}
+				currentKey = kv.Key
+				currentVals = make([]string, 0, 1000)
+			}
+			currentVals = append(currentVals, kv.Value)
 		}
+		fmt.Fprintf(mfb, "%s", t.reduceF(currentKey, currentVals))
+
 		SafeClose(mf, mfb)
 		t.wg.Done()
 	}
@@ -150,13 +161,35 @@ func (c *MRCluster) worker() {
 		t.wg.Done()
 	}
 
+	rConLimit := 8 * c.nWorkers
+	rCon := 0
+
+	mConLimit := 2 * rConLimit
+	mCon := 0
+
 	for {
 		select {
 		case t := <-c.taskCh:
 			if t.phase == mapPhase {
-				go doMap(t)
+				if mCon >= mConLimit {
+					doMap(t)
+				} else {
+					mCon++
+					go func() {
+						doMap(t)
+						mCon--
+					}()
+				}
 			} else {
-				go doReduce(t)
+				if rCon >= rConLimit {
+					doReduce(t)
+				} else {
+					rCon++
+					go func() {
+						doReduce(t)
+						rCon--
+					}()
+				}
 			}
 		case <-c.exit:
 			return
