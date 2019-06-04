@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -100,12 +99,9 @@ func (c *MRCluster) worker() {
 
 		for i := 0; i < t.nMap; i++ {
 			rpath := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
-			content, err := ioutil.ReadFile(rpath)
-			if err != nil {
-				panic(err)
-			}
-			rd := bytes.NewReader(content)
-			dec := json.NewDecoder(rd)
+			file, reader := OpenFileAndBuf(rpath)
+			defer file.Close()
+			dec := json.NewDecoder(reader)
 			for dec.More() {
 				if err := dec.Decode(&kv); err != nil {
 					log.Fatalln(err)
@@ -131,7 +127,9 @@ func (c *MRCluster) worker() {
 			}
 			currentVals = append(currentVals, kv.Value)
 		}
-		fmt.Fprintf(mfb, "%s", t.reduceF(currentKey, currentVals))
+		if len(currentVals) > 0 {
+			fmt.Fprintf(mfb, "%s", t.reduceF(currentKey, currentVals))
+		}
 
 		SafeClose(mf, mfb)
 		t.wg.Done()
@@ -161,35 +159,37 @@ func (c *MRCluster) worker() {
 		t.wg.Done()
 	}
 
-	rConLimit := 8 * c.nWorkers
-	rCon := 0
+	// rConLimit := 256
+	// rCon := 0
 
-	mConLimit := 2 * rConLimit
-	mCon := 0
+	// mConLimit := 256
+	// mCon := 0
 
 	for {
 		select {
 		case t := <-c.taskCh:
 			if t.phase == mapPhase {
-				if mCon >= mConLimit {
-					doMap(t)
-				} else {
-					mCon++
-					go func() {
-						doMap(t)
-						mCon--
-					}()
-				}
+				// if mCon >= mConLimit {
+				// 	doMap(t)
+				// } else {
+				// 	mCon++
+				// 	go func() {
+				// 		doMap(t)
+				// 		mCon--
+				// 	}()
+				// }
+				go doMap(t)
 			} else {
-				if rCon >= rConLimit {
-					doReduce(t)
-				} else {
-					rCon++
-					go func() {
-						doReduce(t)
-						rCon--
-					}()
-				}
+				// if rCon >= rConLimit {
+				// 	doReduce(t)
+				// } else {
+				// 	rCon++
+				// 	go func() {
+				// 		doReduce(t)
+				// 		rCon--
+				// 	}()
+				// }
+				go doReduce(t)
 			}
 		case <-c.exit:
 			return
