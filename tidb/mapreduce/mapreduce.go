@@ -10,7 +10,6 @@ import (
 	"os"
 	"path"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -94,41 +93,33 @@ func (c *MRCluster) worker() {
 	defer c.wg.Done()
 
 	doReduce := func(t *task) {
-		kvs := make([]KeyValue, 0, 10000)
 		var kv KeyValue
+		var rpath string
+		var file *os.File
+		var reader *bufio.Reader
+		var dec *json.Decoder
+		groupByKey := make(map[string][]string)
 
 		for i := 0; i < t.nMap; i++ {
-			rpath := reduceName(t.dataDir, t.jobName, i, t.taskNumber)
-			file, reader := OpenFileAndBuf(rpath)
-			defer file.Close()
-			dec := json.NewDecoder(reader)
-			for dec.More() {
+			rpath = reduceName(t.dataDir, t.jobName, i, t.taskNumber)
+			file, reader = OpenFileAndBuf(rpath)
+			dec = json.NewDecoder(reader)
+			for {
 				if err := dec.Decode(&kv); err != nil {
-					log.Fatalln(err)
+					break
 				}
-				kvs = append(kvs, kv)
+				if _, ok := groupByKey[kv.Key]; ok != true {
+					groupByKey[kv.Key] = make([]string, 0)
+				}
+				groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
 			}
+			file.Close()
 		}
-
-		sort.Sort(ByKey(kvs))
 
 		mf, mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
 
-		var currentKey string
-		var currentVals []string
-
-		for i, kv := range kvs {
-			if currentKey != kv.Key {
-				if i > 0 {
-					fmt.Fprintf(mfb, "%s", t.reduceF(currentKey, currentVals))
-				}
-				currentKey = kv.Key
-				currentVals = make([]string, 0, 1000)
-			}
-			currentVals = append(currentVals, kv.Value)
-		}
-		if len(currentVals) > 0 {
-			fmt.Fprintf(mfb, "%s", t.reduceF(currentKey, currentVals))
+		for key, vals := range groupByKey {
+			fmt.Fprintf(mfb, "%s", t.reduceF(key, vals))
 		}
 
 		SafeClose(mf, mfb)
