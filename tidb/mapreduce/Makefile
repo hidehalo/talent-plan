@@ -6,10 +6,13 @@ test_example:
 	go test -timeout=120m -v -run=TestExampleURLTop
 
 pprof_test_example:
-	go test -timeout=120m --trace=trace.out --cpuprofile=cpu.out --blockprofile=block.out -v -run=TestExampleURLTop
+	go test -timeout=120m --trace=trace.out --cpuprofile=cpu.out --blockprofile=block.out --memprofile=mem.out -v -run=TestExampleURLTop
 
 test_homework:
 	go test -timeout=120m -v -run=TestURLTop
+
+pprof_test_homework:
+	go test -timeout=120m --trace=trace.out --cpuprofile=cpu.out --blockprofile=block.out --memprofile=mem.out -v -run=TestURLTop
 
 cleanup:
 	go test -v -run=TestCleanData

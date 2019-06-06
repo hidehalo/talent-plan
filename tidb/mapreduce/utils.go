@@ -77,7 +77,7 @@ func CreateFileAndBuf(fpath string) (*os.File, *bufio.Writer) {
 	if err != nil {
 		panic(err)
 	}
-	return f, bufio.NewWriterSize(f, 1<<20)
+	return f, bufio.NewWriterSize(f, 256*KB)
 }
 
 // OpenFileAndBuf opens a specific file for reading.

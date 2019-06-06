@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"log"
@@ -91,101 +90,84 @@ func (c *MRCluster) Start() {
 
 func (c *MRCluster) worker() {
 	defer c.wg.Done()
-
-	doReduce := func(t *task) {
-		var kv KeyValue
-		var rpath string
-		var file *os.File
-		var reader *bufio.Reader
-		var dec *json.Decoder
-		groupByKey := make(map[string][]string)
-
-		for i := 0; i < t.nMap; i++ {
-			rpath = reduceName(t.dataDir, t.jobName, i, t.taskNumber)
-			file, reader = OpenFileAndBuf(rpath)
-			dec = json.NewDecoder(reader)
-			for {
-				if err := dec.Decode(&kv); err != nil {
-					break
-				}
-				if _, ok := groupByKey[kv.Key]; ok != true {
-					groupByKey[kv.Key] = make([]string, 0)
-				}
-				groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
-			}
-			file.Close()
-		}
-
-		mf, mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
-
-		for key, vals := range groupByKey {
-			fmt.Fprintf(mfb, "%s", t.reduceF(key, vals))
-		}
-
-		SafeClose(mf, mfb)
-		t.wg.Done()
-	}
-
-	doMap := func(t *task) {
-		content, err := ioutil.ReadFile(t.mapFile)
-		if err != nil {
-			panic(err)
-		}
-		fs := make([]*os.File, t.nReduce)
-		bs := make([]*bufio.Writer, t.nReduce)
-		for i := range fs {
-			rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
-			fs[i], bs[i] = CreateFileAndBuf(rpath)
-		}
-		results := t.mapF(t.mapFile, string(content))
-		for _, kv := range results {
-			enc := json.NewEncoder(bs[ihash(kv.Key)%t.nReduce])
-			if err := enc.Encode(&kv); err != nil {
-				log.Fatalln(err)
-			}
-		}
-		for i := range fs {
-			SafeClose(fs[i], bs[i])
-		}
-		t.wg.Done()
-	}
-
-	// rConLimit := 256
-	// rCon := 0
-
-	// mConLimit := 256
-	// mCon := 0
-
+	concurrentMax := 2
+	concurrent := 0
 	for {
 		select {
 		case t := <-c.taskCh:
 			if t.phase == mapPhase {
-				// if mCon >= mConLimit {
-				// 	doMap(t)
-				// } else {
-				// 	mCon++
-				// 	go func() {
-				// 		doMap(t)
-				// 		mCon--
-				// 	}()
-				// }
-				go doMap(t)
+				content, err := ioutil.ReadFile(t.mapFile)
+				if err != nil {
+					panic(err)
+				}
+				fs := make([]*os.File, t.nReduce)
+				bs := make([]*bufio.Writer, t.nReduce)
+				for i := range fs {
+					rpath := reduceName(t.dataDir, t.jobName, t.taskNumber, i)
+					fs[i], bs[i] = CreateFileAndBuf(rpath)
+				}
+				results := t.mapF(t.mapFile, string(content))
+				for _, kv := range results {
+					enc := json.NewEncoder(bs[ihash(kv.Key)%t.nReduce])
+					if err := enc.Encode(&kv); err != nil {
+						log.Fatalln(err)
+					}
+				}
+				for i := range fs {
+					SafeClose(fs[i], bs[i])
+				}
+				t.wg.Done()
 			} else {
-				// if rCon >= rConLimit {
-				// 	doReduce(t)
-				// } else {
-				// 	rCon++
-				// 	go func() {
-				// 		doReduce(t)
-				// 		rCon--
-				// 	}()
-				// }
-				go doReduce(t)
+				if concurrent > concurrentMax {
+					doReduce(t)
+				} else {
+					concurrent++
+					go func() {
+						doReduce(t)
+						concurrent--
+
+					}()
+				}
 			}
 		case <-c.exit:
 			return
 		}
 	}
+}
+
+func doReduce(t *task) {
+	groupByKey := make(map[string][]string)
+	fs := make([]*os.File, t.nMap)
+	bs := make([]*bufio.Reader, t.nMap)
+
+	for i := range fs {
+		fs[i], bs[i] = OpenFileAndBuf(reduceName(t.dataDir, t.jobName, i, t.taskNumber))
+		defer fs[i].Close()
+	}
+
+	for i := 0; i < t.nMap; i++ {
+		reader := bs[i]
+		dec := json.NewDecoder(reader)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			if _, ok := groupByKey[kv.Key]; ok != true {
+				groupByKey[kv.Key] = make([]string, 0)
+			}
+			groupByKey[kv.Key] = append(groupByKey[kv.Key], kv.Value)
+		}
+	}
+
+	mf, mfb := CreateFileAndBuf(mergeName(t.dataDir, t.jobName, t.taskNumber))
+
+	for key, vals := range groupByKey {
+		WriteToBuf(mfb, t.reduceF(key, vals))
+	}
+
+	SafeClose(mf, mfb)
+	t.wg.Done()
 }
 
 // Shutdown shutdowns this cluster.
