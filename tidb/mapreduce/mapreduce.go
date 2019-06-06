@@ -10,16 +10,8 @@ import (
 	"path"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 )
-
-// ByKey order KeyValue set ASC
-type ByKey []KeyValue
-
-func (kv ByKey) Len() int           { return len(kv) }
-func (kv ByKey) Swap(i, j int)      { kv[i], kv[j] = kv[j], kv[i] }
-func (kv ByKey) Less(i, j int) bool { return strings.Compare(kv[i].Key, kv[j].Key) == -1 }
 
 // KeyValue is a type used to hold the key/value pairs passed to the map and reduce functions.
 type KeyValue struct {
@@ -145,11 +137,12 @@ func doReduce(t *task) {
 		defer fs[i].Close()
 	}
 
+	var kv KeyValue
+
 	for i := 0; i < t.nMap; i++ {
 		reader := bs[i]
 		dec := json.NewDecoder(reader)
 		for {
-			var kv KeyValue
 			if err := dec.Decode(&kv); err != nil {
 				break
 			}
