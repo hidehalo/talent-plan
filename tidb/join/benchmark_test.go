@@ -13,3 +13,11 @@ func BenchmarkJoinExample(b *testing.B) {
 		JoinExample("./t/r0.tbl", "./t/r2.tbl", []int{0}, []int{1})
 	}
 }
+
+func BenchmarkReadCSV(b *testing.B) {
+	// TODO:impl
+}
+
+func BenchmarkParalleReadCSV(b *testing.B) {
+	// TODO:impl
+}
