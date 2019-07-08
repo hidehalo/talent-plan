@@ -12,3 +12,15 @@ package main
 func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
 	return sum
 }
+
+type ParalleCSVReader struct {
+
+}
+
+func buildHashTable(data [][]string, offset []int) (hashtable *mvmap.MVMap) {
+
+}
+
+func probe(hashtable *mvmap.MVMap, row []string, offset []int) (rowIDs []int64) {
+
+}
