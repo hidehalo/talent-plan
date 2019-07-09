@@ -22,7 +22,6 @@ func BenchmarkReadCSV(b *testing.B) {
 
 func BenchmarkParalleReadCSV(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		p := NewParalleCSVReader(10)
-		p.ReadCSV("./t/r0.tbl")
+		ReadCSV("./t/r0.tbl")
 	}
 }

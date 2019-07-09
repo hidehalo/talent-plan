@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"io"
 	"os"
-	"sync"
 )
 
 // Join accepts a join query of two relations, and returns the sum of
@@ -21,53 +20,29 @@ func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
 	return sum
 }
 
-type ParalleCSVReader struct {
-	readChan    []chan []byte // Read file channel,line by line
-	contents    [][][]byte    // Contents of file,split via EOL
-	concurrency uint          // Concurrency
-}
-
-func NewParalleCSVReader(concurrency uint) *ParalleCSVReader {
-	pcr := &ParalleCSVReader{
-		readChan:    make([]chan []byte, concurrency),
-		contents:    make([][][]byte, 0),
-		concurrency: concurrency,
-	}
-	for i := uint(0); i < concurrency; i++ {
-		pcr.readChan[i] = make(chan []byte, 500)
-	}
-
-	return pcr
-}
-
-func (pcr *ParalleCSVReader) ReadCSV(filepath string) {
+func ReadCSV(filepath string) []*[][]byte {
+	contents := make([]*[][]byte, 0)
 	csvFile, _ := os.Open(filepath)
 	reader := bufio.NewReader(csvFile)
-	var wg sync.WaitGroup
+	comma := []byte{','}
 
-	for i := uint(0); i < pcr.concurrency; i++ {
-		go func(id uint) {
-			for record := range pcr.readChan[id] {
-				recordBytes := bytes.Split([]byte{','}, record)
-				pcr.contents = append(pcr.contents, recordBytes)
-				wg.Done()
-			}
-		}(i)
-	}
-
-	c := uint(0)
 	for {
-		c %= pcr.concurrency
 		line, _, err := reader.ReadLine()
+		// if line[len(line)-1] == '\n' {
+		// 	tmp := bytes.Split(line[:len(line)-1], comma)
+		// 	contents = append(contents, &tmp)
+		// } else {
+		// 	tmp := bytes.Split(line, comma)
+		// 	contents = append(contents, &tmp)
+		// }
 		if err == io.EOF {
 			break
 		}
-		wg.Add(1)
-		pcr.readChan[c] <- line
-		c++
+		tmp := bytes.Split(line, comma)
+		contents = append(contents, &tmp)
 	}
 
-	wg.Wait()
+	return contents
 }
 
 // func buildHashTable(data [][]string, offset []int) (hashtable *mvmap.MVMap) {
