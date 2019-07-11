@@ -2,26 +2,40 @@ package main
 
 import "testing"
 
-// func BenchmarkJoin(b *testing.B) {
+// func BenchmarkReadCSVIntoTbl(b *testing.B) {
 // 	for i := 0; i < b.N; i++ {
-// 		Join("./t/r0.tbl", "./t/r2.tbl", []int{0}, []int{1})
+// 		readCSVFileIntoTbl("./bt/r2.tbl")
 // 	}
 // }
 
-// func BenchmarkJoinExample(b *testing.B) {
+// func BenchmarkReadCSV(b *testing.B) {
 // 	for i := 0; i < b.N; i++ {
-// 		JoinExample("./t/r0.tbl", "./t/r2.tbl", []int{0}, []int{1})
+// 		readCSV("./bt/r2.tbl")
 // 	}
 // }
 
-func BenchmarkReadCSV(b *testing.B) {
+// func BenchmarkBuildHashTable(b *testing.B) {
+// 	data := readCSVFileIntoTbl("./bt/r2.tbl")
+// 	for i := 0; i < b.N; i++ {
+// 		buildHashTable(data, []int{0})
+// 	}
+// }
+
+// func BenchmarkBuild(b *testing.B) {
+// 	data := readCSV("./bt/r2.tbl")
+// 	for i := 0; i < b.N; i++ {
+// 		build(data, []int{0})
+// 	}
+// }
+
+func BenchmarkJoinExample(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		readCSVFileIntoTbl("./t/r0.tbl")
+		JoinExample("./bt/r8.tbl", "./bt/r7.tbl", []int{0}, []int{1})
 	}
 }
 
-func BenchmarkParalleReadCSV(b *testing.B) {
+func BenchmarkJoin(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		ReadCSV("./t/r0.tbl")
+		Join("./bt/r8.tbl", "./bt/r7.tbl", []int{0}, []int{1})
 	}
 }
