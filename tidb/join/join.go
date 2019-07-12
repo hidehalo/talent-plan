@@ -13,6 +13,20 @@ import (
 	"github.com/pingcap/tidb/util/mvmap"
 )
 
+type probeWorker struct {
+	chunk       [][][]byte
+	offset      []int
+	buildWorker *buildWorker
+	result      uint64
+}
+
+type buildWorker struct {
+	id          int
+	chunks      [][][]byte
+	hashtable   chan *mvmap.MVMap
+	regionStart int
+}
+
 // Join accepts a join query of two relations, and returns the sum of
 // relation0.col0 in the final result.
 // Input arguments:
@@ -25,42 +39,41 @@ import (
 func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
 	tbl0, tbl1 := readCSV(f0), readCSV(f1)
 	var (
-		hashtable   *hashTable
 		probeTable  *[][][]byte
 		buildTable  *[][][]byte
 		probeOffset *[]int
+		buildOffset *[]int
 	)
 
 	if len(tbl0) > len(tbl1) {
 		probeTable = &tbl0
 		probeOffset = &offset0
 		buildTable = &tbl1
-		hashtable = build(tbl1, offset1)
+		buildOffset = &offset1
 	} else {
 		probeTable = &tbl1
 		probeOffset = &offset1
 		buildTable = &tbl0
-		hashtable = build(tbl0, offset0)
+		buildOffset = &offset0
 	}
 
-	concurrency := runtime.NumCPU()
-	chunkSize := len(*probeTable) / concurrency
-	workers := make([]*joinWorker, 0)
+	buildWorkers := conBuild(*buildTable, *buildOffset)
+	probeWorkers := make([]*probeWorker, 0)
 
-	for i := 0; i < concurrency; i++ {
-		up := i * chunkSize
-		down := up + chunkSize
-		if down > len(*probeTable) {
-			down = len(*probeTable)
+	var wg sync.WaitGroup
+	for j := 0; j < len(buildWorkers); j++ {
+		w := &probeWorker{
+			chunk:       (*probeTable),
+			buildWorker: buildWorkers[j],
+			offset:      *probeOffset,
+			result:      uint64(0),
 		}
-		w := &joinWorker{
-			chunk:  (*probeTable)[up:down],
-			offset: *probeOffset,
-			result: make(chan uint64),
-		}
-		workers = append(workers, w)
-		go func(w *joinWorker) {
+		probeWorkers = append(probeWorkers, w)
+		wg.Add(1)
+		go func(w *probeWorker) {
+			defer wg.Done()
 			sum := uint64(0)
+			hashtable := <-w.buildWorker.hashtable
 			for _, row := range w.chunk {
 				rowIDs := _probe(hashtable, row, *probeOffset)
 				for _, id := range rowIDs {
@@ -71,12 +84,14 @@ func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
 					sum += v
 				}
 			}
-			w.result <- sum
+			w.result = sum
 		}(w)
 	}
 
-	for _, w := range workers {
-		sum += <-w.result
+	wg.Wait()
+
+	for _, w := range probeWorkers {
+		sum += w.result
 	}
 
 	return sum
@@ -92,74 +107,38 @@ func readCSV(filepath string) [][][]byte {
 	var err error
 
 	for {
-		var tmp [][]byte
-
 		line, err = reader.ReadBytes('\n')
-		// line, err = reader.ReadSlice('\n')
 		if err == io.EOF {
 			if len(line) > 0 {
-				tmp = bytes.Split(line, comma)
-				tbl = append(tbl, tmp)
+				tbl = append(tbl, bytes.Split(line, comma))
 			}
 			break
 		}
-		tmp = bytes.Split(line[:len(line)-1], comma)
-		tbl = append(tbl, tmp)
+		tbl = append(tbl, bytes.Split(line[:len(line)-1], comma))
 	}
 
 	return tbl
 }
 
-type joinWorker struct {
-	chunk  [][][]byte
-	offset []int
-	result chan uint64
-}
-
-type buildWorker struct {
-	id          int
-	chunks      [][][]byte
-	hashtable   *mvmap.MVMap
-	regionStart int
-}
-
-type hashTable struct {
-	hashtables []*mvmap.MVMap
-}
-
-func (ht *hashTable) Get(keyHash []byte, vals [][]byte) [][]byte {
-	for _, hashtable := range ht.hashtables {
-		vals = hashtable.Get(keyHash, vals)
-	}
-	return vals
-}
-
-func (ht *hashTable) Len() int {
-	len := 0
-	for _, hashtable := range ht.hashtables {
-		len += hashtable.Len()
-	}
-	return len
-}
-
-func (w *buildWorker) build(offset []int, ch chan *buildWorker) {
+func (w *buildWorker) build(offset []int) {
 	var keyBuffer []byte
 	valBuffer := make([]byte, 8)
+	hashtable := mvmap.NewMVMap()
 	for i, row := range w.chunks {
 		for _, off := range offset {
 			keyBuffer = append(keyBuffer, row[off]...)
 		}
 		*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(w.regionStart + i)
-		w.hashtable.Put(keyBuffer, valBuffer)
+		hashtable.Put(keyBuffer, valBuffer)
 		keyBuffer = keyBuffer[:0]
 	}
-	ch <- w
+	w.hashtable <- hashtable
 }
 
-func build(data [][][]byte, offset []int) *hashTable {
+func conBuild(data [][][]byte, offset []int) []*buildWorker {
 	concurrency := runtime.NumCPU()
 	chunkSize := len(data) / concurrency
-	ch := make(chan *buildWorker, concurrency)
+	buildWorkers := make([]*buildWorker, 0)
 
 	for i := 0; i < concurrency; i++ {
 		down := i * chunkSize
@@ -170,32 +149,17 @@ func build(data [][][]byte, offset []int) *hashTable {
 		w := &buildWorker{
 			id:          i,
 			chunks:      data[down:up],
-			hashtable:   mvmap.NewMVMap(),
+			hashtable:   make(chan *mvmap.MVMap),
 			regionStart: down,
 		}
-		go w.build(offset, ch)
+		buildWorkers = append(buildWorkers, w)
+		go w.build(offset)
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(concurrency)
-	hashtable := &hashTable{
-		hashtables: make([]*mvmap.MVMap, concurrency),
-	}
-
-	for i := 0; i < concurrency; i++ {
-		go func() {
-			defer wg.Done()
-			w := <-ch
-			hashtable.hashtables[w.id] = w.hashtable
-		}()
-	}
-
-	wg.Wait()
-
-	return hashtable
+	return buildWorkers
 }
 
-func _probe(hashtable *hashTable, row [][]byte, offset []int) (rowIDs []int64) {
+func _probe(hashtable *mvmap.MVMap, row [][]byte, offset []int) (rowIDs []int64) {
 	var keyHash []byte
 	var vals [][]byte
 	for _, off := range offset {
