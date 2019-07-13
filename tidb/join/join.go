@@ -14,17 +14,26 @@ import (
 )
 
 type probeWorker struct {
-	chunk       [][][]byte
-	offset      []int
-	buildWorker *buildWorker
-	result      uint64
+	rangeCh chan []int
+	closeCh chan bool
+	result  uint64
 }
 
-type buildWorker struct {
-	id          int
-	chunks      [][][]byte
-	hashtable   chan *mvmap.MVMap
-	regionStart int
+type hashIndex struct {
+	h []*mvmap.MVMap
+}
+
+type chunk struct {
+	data   [][][]byte
+	offset int
+}
+
+func (hi *hashIndex) Get(k []byte) [][]byte {
+	var v [][]byte
+	for _, m := range hi.h {
+		v = m.Get(k, v)
+	}
+	return v
 }
 
 // Join accepts a join query of two relations, and returns the sum of
@@ -37,69 +46,95 @@ type buildWorker struct {
 // Output arguments:
 //   sum: sum of relation0.col0 in the final result
 func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
-	tbl0, tbl1 := readCSV(f0), readCSV(f1)
 	var (
 		probeTable  *[][][]byte
 		buildTable  *[][][]byte
 		probeOffset *[]int
 		buildOffset *[]int
 	)
-
-	if len(tbl0) > len(tbl1) {
-		probeTable = &tbl0
+	// 读取关系表
+	tbl0, tbl1 := readTables(f0, f1)
+	if len(*tbl0) > len(*tbl1) {
+		probeTable = tbl0
 		probeOffset = &offset0
-		buildTable = &tbl1
+		buildTable = tbl1
 		buildOffset = &offset1
 	} else {
-		probeTable = &tbl1
+		probeTable = tbl1
 		probeOffset = &offset1
-		buildTable = &tbl0
+		buildTable = tbl0
 		buildOffset = &offset0
 	}
+	// 构建散列索引结构
+	// hashtable := _build(*buildTable, *buildOffset)
+	hashtable := _concurrentBuild(*buildTable, *buildOffset)
+	// 探测并返回求和结果
+	return probeTblWithSum(hashtable, buildTable, probeTable, probeOffset)
+}
 
-	buildWorkers := conBuild(*buildTable, *buildOffset)
-	probeWorkers := make([]*probeWorker, 0)
-
+// 探测关系元组并返回col0求和结果
+func probeTblWithSum(hashtable *hashIndex, buildTable *[][][]byte, probeTable *[][][]byte, probeOffset *[]int) uint64 {
+	concurrency := runtime.NumCPU()
+	probeWorkers := make([]*probeWorker, concurrency)
 	var wg sync.WaitGroup
-	for j := 0; j < len(buildWorkers); j++ {
-		w := &probeWorker{
-			chunk:       (*probeTable),
-			buildWorker: buildWorkers[j],
-			offset:      *probeOffset,
-			result:      uint64(0),
+	ch := make(chan []int, 2)
+	for i := 0; i < concurrency; i++ {
+		probeWorkers[i] = &probeWorker{
+			rangeCh: ch,
+			closeCh: make(chan bool),
+			result:  uint64(0),
 		}
-		probeWorkers = append(probeWorkers, w)
-		wg.Add(1)
 		go func(w *probeWorker) {
-			defer wg.Done()
-			sum := uint64(0)
-			hashtable := <-w.buildWorker.hashtable
-			for _, row := range w.chunk {
-				rowIDs := _probe(hashtable, row, *probeOffset)
-				for _, id := range rowIDs {
-					v, err := strconv.ParseUint(string((*buildTable)[id][0]), 10, 64)
-					if err != nil {
-						panic("Join panic\n" + err.Error())
+			for {
+				select {
+				case ran := <-w.rangeCh:
+					for _, row := range (*probeTable)[ran[0]:ran[1]] {
+						rowIDs := _probe(hashtable, row, *probeOffset)
+						for _, id := range rowIDs {
+							v, err := strconv.ParseUint(string((*buildTable)[id][0]), 10, 64)
+							if err != nil {
+								panic("Join panic\n" + err.Error())
+							}
+							w.result += v
+						}
 					}
-					sum += v
+					wg.Done()
+				case <-w.closeCh:
+					return
 				}
 			}
-			w.result = sum
-		}(w)
+		}(probeWorkers[i])
 	}
-
+	// 增加探测任务数量，提升探测任务执行快情景下的速度，使多核上的调度更加均衡
+	threshold := len(*probeTable) / concurrency / 4
+	if threshold < 1 {
+		threshold = 1
+	}
+	var end int
+	for j := 0; j < len(*probeTable); {
+		end = j + threshold
+		if len(*probeTable) < end {
+			end = len(*probeTable)
+		}
+		wg.Add(1)
+		ch <- []int{j, end}
+		j = end
+	}
 	wg.Wait()
 
+	sum := uint64(0)
 	for _, w := range probeWorkers {
 		sum += w.result
+		w.closeCh <- true
 	}
 
 	return sum
 }
 
-// readCSV 从CSV文件中读取内容并解析
+// 读取CSV文件内容并解析
 func readCSV(filepath string) [][][]byte {
 	csvFile, _ := os.Open(filepath)
+	defer csvFile.Close()
 	reader := bufio.NewReader(csvFile)
 	comma := []byte{','}
 	var tbl [][][]byte
@@ -120,52 +155,117 @@ func readCSV(filepath string) [][][]byte {
 	return tbl
 }
 
-func (w *buildWorker) build(offset []int) {
+//
+func readTables(tbl0Path, tbl1Path string) (*[][][]byte, *[][][]byte) {
+	if tbl0Path == tbl1Path {
+		tbl0 := readCSV(tbl0Path)
+		return &tbl0, &tbl0
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var tbl0, tbl1 [][][]byte
+	go func() {
+		defer wg.Done()
+		tbl0 = readCSV(tbl0Path)
+	}()
+	go func() {
+		defer wg.Done()
+		tbl1 = readCSV(tbl1Path)
+	}()
+	wg.Wait()
+
+	return &tbl0, &tbl1
+}
+
+// （并发）构建散列索引结构
+func _concurrentBuild(data [][][]byte, offset []int) *hashIndex {
+	wg := new(sync.WaitGroup)
+	concurrency := runtime.NumCPU()
+	hashIndex := &hashIndex{
+		h: make([]*mvmap.MVMap, concurrency),
+	}
+	for n := range hashIndex.h {
+		hashIndex.h[n] = mvmap.NewMVMap()
+	}
+	chunkCh := make(chan *chunk, concurrency)
+	closeCh := make(chan bool)
+	// 创建workers
+	for i := 0; i < concurrency; i++ {
+		go func(id int) {
+			var keyBuffer []byte
+			valBuffer := make([]byte, 8)
+			for {
+				select {
+				case chunk := <-chunkCh:
+					for i, row := range chunk.data {
+						for _, off := range offset {
+							keyBuffer = append(keyBuffer, row[off]...)
+						}
+						*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(chunk.offset + i)
+						hashIndex.h[id].Put(keyBuffer, valBuffer)
+						keyBuffer = keyBuffer[:0]
+					}
+					wg.Done()
+				case <-closeCh:
+					return
+				}
+			}
+		}(i)
+	}
+	// 产生任务
+	chunkSize := len(data) / concurrency
+	if chunkSize < 1 {
+		chunkSize = 1
+	}
+	end := 0
+	for j := 0; j < len(data); {
+		end += chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		wg.Add(1)
+		go func(s, e int) {
+			chunkCh <- &chunk{
+				data:   data[s:e],
+				offset: s,
+			}
+		}(j, end)
+		j = end
+	}
+	wg.Wait()
+	// 关闭workers
+	for i := 0; i < concurrency; i++ {
+		closeCh <- true
+	}
+
+	return hashIndex
+}
+
+// 构建散列索引结构
+func _build(data [][][]byte, offset []int) *hashIndex {
 	var keyBuffer []byte
 	valBuffer := make([]byte, 8)
 	hashtable := mvmap.NewMVMap()
-	for i, row := range w.chunks {
+	for i, row := range data {
 		for _, off := range offset {
 			keyBuffer = append(keyBuffer, row[off]...)
 		}
-		*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(w.regionStart + i)
+		*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(i)
 		hashtable.Put(keyBuffer, valBuffer)
 		keyBuffer = keyBuffer[:0]
 	}
-	w.hashtable <- hashtable
+	return &hashIndex{[]*mvmap.MVMap{hashtable}}
 }
 
-func conBuild(data [][][]byte, offset []int) []*buildWorker {
-	concurrency := runtime.NumCPU()
-	chunkSize := len(data) / concurrency
-	buildWorkers := make([]*buildWorker, 0)
-
-	for i := 0; i < concurrency; i++ {
-		down := i * chunkSize
-		up := down + chunkSize
-		if up > len(data) {
-			up = len(data)
-		}
-		w := &buildWorker{
-			id:          i,
-			chunks:      data[down:up],
-			hashtable:   make(chan *mvmap.MVMap),
-			regionStart: down,
-		}
-		buildWorkers = append(buildWorkers, w)
-		go w.build(offset)
-	}
-
-	return buildWorkers
-}
-
-func _probe(hashtable *mvmap.MVMap, row [][]byte, offset []int) (rowIDs []int64) {
+// 探测一行元组
+func _probe(hashtable *hashIndex, row [][]byte, offset []int) (rowIDs []int64) {
 	var keyHash []byte
-	var vals [][]byte
+	// var vals [][]byte
 	for _, off := range offset {
 		keyHash = append(keyHash, row[off]...)
 	}
-	vals = hashtable.Get(keyHash, vals)
+	vals := hashtable.Get(keyHash)
 	for _, val := range vals {
 		rowIDs = append(rowIDs, *(*int64)(unsafe.Pointer(&val[0])))
 	}

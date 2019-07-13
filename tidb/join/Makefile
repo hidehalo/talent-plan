@@ -7,3 +7,6 @@ test:
 
 bench:
 	go test -bench Benchmark -run xx -count 5 -benchmem
+
+trace:
+	go test -bench BenchmarkForTrace -run xx -count 1 -benchmem --cpuprofile=cpu --memprofile=mem --blockprofile=block --trace=trace.out

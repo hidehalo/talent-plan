@@ -2,58 +2,78 @@ package main
 
 import "testing"
 
-var tbl0, tbl1 = readCSVFileIntoTbl("./bt/r2.tbl"), readCSV("./bt/r2.tbl")
-var h0, h1 = buildHashTable(tbl0, []int{0}), conBuild(tbl1, []int{0})
-
-// func BenchmarkReadCSVIntoTbl(b *testing.B) {
-// 	for i := 0; i < b.N; i++ {
-// 		readCSVFileIntoTbl("./bt/r2.tbl")
-// 	}
-// }
-
-// func BenchmarkReadCSV(b *testing.B) {
-// 	for i := 0; i < b.N; i++ {
-// 		readCSV("./bt/r2.tbl")
-// 	}
-// }
-
-// func BenchmarkBuildHashTable(b *testing.B) {
-// 	for i := 0; i < b.N; i++ {
-// 		buildHashTable(tbl0, []int{0})
-// 	}
-// }
-
-// func BenchmarkConBuild(b *testing.B) {
-// 	for i := 0; i < b.N; i++ {
-// 		ch := conBuild(tbl1, []int{0})
-// 		<-ch
-// 	}
-// }
-
-// func BenchmarkProbe(b *testing.B) {
-// 	for i := 0; i < b.N; i++ {
-// 		for j := 0; j < len(tbl0); j++ {
-// 			probe(h0, tbl0[j], []int{1})
-// 		}
-// 	}
-// }
-
-// func BenchmarkSlashProbe(b *testing.B) {
-// 	for i := 0; i < b.N; i++ {
-// 		for j := 0; j < len(tbl0); j++ {
-// 			_probe(h0, tbl1[j], []int{1})
-// 		}
-// 	}
-// }
-
-func BenchmarkJoinExample(b *testing.B) {
+// 小表连接小表
+func BenchmarkJoinExample1(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		JoinExample("./bt/r7.tbl", "./bt/r8.tbl", []int{0}, []int{1})
+		JoinExample("./t/r2.tbl", "./t/r2.tbl", []int{0}, []int{1})
 	}
 }
 
-func BenchmarkJoin(b *testing.B) {
+// 小表连接小表
+func BenchmarkJoin1(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		Join("./bt/r7.tbl", "./bt/r8.tbl", []int{0}, []int{1})
+		Join("./t/r2.tbl", "./t/r2.tbl", []int{0}, []int{1})
 	}
 }
+
+// 小表连接大表
+func BenchmarkJoinExample2(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		JoinExample("./t/r2.tbl", "./t/r1.tbl", []int{0}, []int{1})
+	}
+}
+
+// 小表连接大表
+func BenchmarkJoin2(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		Join("./t/r2.tbl", "./t/r1.tbl", []int{0}, []int{1})
+	}
+}
+
+// 大表连接小表
+func BenchmarkJoinExample3(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		JoinExample("./t/r1.tbl", "./t/r2.tbl", []int{0}, []int{1})
+	}
+}
+
+// 大表连接小表
+func BenchmarkJoin3(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		Join("./t/r1.tbl", "./t/r2.tbl", []int{0}, []int{1})
+	}
+}
+
+// 大表连接小表
+func BenchmarkJoinExample4(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		JoinExample("./t/r1.tbl", "./t/r2.tbl", []int{0}, []int{1})
+	}
+}
+
+// 大表连接小表
+func BenchmarkJoin4(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		Join("./t/r1.tbl", "./t/r2.tbl", []int{0}, []int{1})
+	}
+}
+
+// 自连接
+func BenchmarkJoinExample5(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		JoinExample("./t/r0.tbl", "./t/r0.tbl", []int{0}, []int{0})
+	}
+}
+
+// 自连接
+func BenchmarkJoin5(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		Join("./t/r0.tbl", "./t/r0.tbl", []int{0}, []int{0})
+	}
+}
+
+// func BenchmarkForTrace(b *testing.B) {
+// 	for i := 0; i < b.N; i++ {
+// 		Join("./bt/r8.tbl", "./bt/r7.tbl", []int{0}, []int{1})
+// 	}
+// }
