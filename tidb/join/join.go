@@ -66,7 +66,6 @@ func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
 		buildOffset = &offset0
 	}
 	// 构建散列索引结构
-	// hashtable := _build(*buildTable, *buildOffset)
 	hashtable := _concurrentBuild(*buildTable, *buildOffset)
 	// 探测并返回求和结果
 	return probeTblWithSum(hashtable, buildTable, probeTable, probeOffset)
@@ -240,22 +239,6 @@ func _concurrentBuild(data [][][]byte, offset []int) *hashIndex {
 	}
 
 	return hashIndex
-}
-
-// 构建散列索引结构
-func _build(data [][][]byte, offset []int) *hashIndex {
-	var keyBuffer []byte
-	valBuffer := make([]byte, 8)
-	hashtable := mvmap.NewMVMap()
-	for i, row := range data {
-		for _, off := range offset {
-			keyBuffer = append(keyBuffer, row[off]...)
-		}
-		*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(i)
-		hashtable.Put(keyBuffer, valBuffer)
-		keyBuffer = keyBuffer[:0]
-	}
-	return &hashIndex{[]*mvmap.MVMap{hashtable}}
 }
 
 // 探测一行元组
