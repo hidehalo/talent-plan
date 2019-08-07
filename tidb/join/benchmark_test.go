@@ -72,11 +72,11 @@ func BenchmarkJoin5(b *testing.B) {
 	}
 }
 
-func BenchmarkForTraceExample(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		JoinExample("./bt/r8.tbl", "./bt/r8.tbl", []int{0}, []int{1})
-	}
-}
+// func BenchmarkForTraceExample(b *testing.B) {
+// 	for i := 0; i < b.N; i++ {
+// 		JoinExample("./bt/r8.tbl", "./bt/r8.tbl", []int{0}, []int{1})
+// 	}
+// }
 
 func BenchmarkForTrace(b *testing.B) {
 	for i := 0; i < b.N; i++ {
