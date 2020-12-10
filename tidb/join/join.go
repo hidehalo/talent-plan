@@ -80,6 +80,7 @@ type tableReader struct {
 	ctx      context.Context
 	close    context.CancelFunc
 	path     string
+	colsMap  []int
 	chunkIn  chan *chunk
 	chunkOut chan *chunk
 }
@@ -96,51 +97,68 @@ func newTableReader(ctx context.Context, path string, chunkNum, chunkCap int) *t
 }
 
 func (tableReader *tableReader) read(colsNeed []int) chan *chunk {
-	go func() {
-		defer func() {
-			close(tableReader.chunkOut)
-			tableReader.close()
-		}()
-		csvFile, err := os.Open(tableReader.path)
-		if err != nil {
-			panic(err)
-		}
-		defer csvFile.Close()
-		reader := bufio.NewReader(csvFile)
-		comma := []byte{','}
-		var line []byte
-		chunk := tableReader.borrowChunk()
-		for {
-			select {
-			case <-tableReader.ctx.Done():
-				return
-			default:
-				if chunk.isFull() {
-					tableReader.chunkOut <- chunk
-					chunk = tableReader.borrowChunk()
+	go tableReader.fetchData()
+	return tableReader.chunkOut
+}
+
+func (tableReader *tableReader) readRow(rawRow []byte, sep byte, chunk *chunk) {
+	if len(rawRow) > 0 {
+		row := bytes.Split(rawRow, []byte{sep})
+		if tableReader.colsMap != nil {
+			for i := 0; i < len(row); i++ {
+				for newIdx, oldIdx := range tableReader.colsMap {
+					row[i][newIdx], row[i][oldIdx] = row[i][oldIdx], row[i][newIdx]
 				}
-				line, err = reader.ReadBytes('\n')
-				if err == io.EOF {
-					if len(line) > 0 {
-						chunk.appendRow(bytes.Split(line, comma))
-					}
-					tableReader.chunkOut <- chunk
-					return
-				}
-				chunk.appendRow(bytes.Split(line[:len(line)-1], comma))
+				row[i] = row[i][:len(tableReader.colsMap)]
 			}
 		}
+		chunk.appendRow(row)
+	}
+}
+
+func (tableReader *tableReader) fetchData() {
+	defer func() {
+		close(tableReader.chunkOut)
+		tableReader.close()
 	}()
-	return tableReader.chunkOut
+	csvFile, err := os.Open(tableReader.path)
+	if err != nil {
+		panic(err)
+	}
+	defer csvFile.Close()
+	reader := bufio.NewReader(csvFile)
+	var line []byte
+	chunk := tableReader.borrowChunk()
+	for {
+		select {
+		case <-tableReader.ctx.Done():
+			return
+		default:
+			if chunk.isFull() {
+				tableReader.chunkOut <- chunk
+				chunk = tableReader.borrowChunk()
+			}
+			line, err = reader.ReadBytes('\n')
+			if err == io.EOF {
+				tableReader.readRow(line, ',', chunk)
+				tableReader.chunkOut <- chunk
+				return
+			} else if err == nil {
+				tableReader.readRow(line, ',', chunk)
+			} else {
+				panic(err)
+			}
+		}
+	}
 }
 
 func (tableReader *tableReader) borrowChunk() *chunk {
 	chunk := <-tableReader.chunkIn
-	chunk.reset()
 	return chunk
 }
 
 func (tableReader *tableReader) releaseChunk(chunk *chunk) {
+	chunk.reset()
 	tableReader.chunkIn <- chunk
 }
 
@@ -245,17 +263,71 @@ loop:
 	return innerTable, hashIndex, err
 }
 
-func (joiner *hashJoiner) join(innerTablePath, outerTablePath string, innerOffset, outerOffset []int) uint64 {
-	joiner.innerTableReader = newTableReader(joiner.ctx, innerTablePath, 10, 1000)
+func (joiner *hashJoiner) joinSelf(innerTablePath string, innerOffset, outerOffset []int) uint64 {
+	// innerColsMap := make([]int, 0, len(innerOffset)+len(outerOffset))
+	// for i, colIdx := range innerOffset {
+	// 	innerColsMap = append(innerColsMap, colIdx)
+	// 	innerOffset[i] = i
+	// }
+	// for i, outerColIdx := range outerOffset {
+	// 	find := false
+	// 	for j, colIdx := range innerColsMap {
+	// 		if colIdx == outerColIdx {
+	// 			find = true
+	// 			outerOffset[i] = j
+	// 			break
+	// 		}
+	// 	}
+	// 	if !find {
+	// 		innerColsMap = append(innerColsMap, outerColIdx)
+	// 		outerOffset[i] = len(innerColsMap)
+	// 	}
+	// }
+	// joiner.innerTableReader.colsMap = innerColsMap
 	innerTable, hashtable, err := joiner.build(innerOffset)
 	if err != nil {
 		panic(err)
 	}
-	if innerTablePath != outerTablePath {
-		joiner.outerTableReader = newTableReader(joiner.ctx, outerTablePath, 10*runtime.NumCPU(), 1000)
-		return joiner.probeStreamWithSum(hashtable, innerTable, outerOffset)
-	}
 	return joiner.probeTblWithSum(hashtable, innerTable, innerTable, outerOffset)
+}
+
+func (joiner *hashJoiner) join(innerTablePath, outerTablePath string, innerOffset, outerOffset []int) uint64 {
+	// innerStat, err := os.Stat(innerTablePath)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// outerStat, err := os.Stat(outerTablePath)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// // inner表用与build hashtable，越小越好
+	// if innerStat.Size() > outerStat.Size() {
+	// 	innerTablePath, outerTablePath = outerTablePath, innerTablePath
+	// 	innerOffset, outerOffset = outerOffset, innerOffset
+	// }
+	joiner.innerTableReader = newTableReader(joiner.ctx, innerTablePath, 1, runtime.NumCPU()*1000)
+	// 相同表不重复读
+	if innerTablePath == outerTablePath {
+		return joiner.joinSelf(innerTablePath, innerOffset, outerOffset)
+	}
+	// innerColsMap := make([]int, 0, len(innerOffset)+1)
+	// for i, colIdx := range innerOffset {
+	// 	innerColsMap = append(innerColsMap, colIdx)
+	// 	innerOffset[i] = i
+	// }
+	// joiner.innerTableReader.colsMap = innerColsMap
+	innerTable, hashtable, err := joiner.build(innerOffset)
+	if err != nil {
+		panic(err)
+	}
+	joiner.outerTableReader = newTableReader(joiner.ctx, outerTablePath, runtime.NumCPU(), 1000)
+	// outerColsMap := make([]int, 0, len(innerOffset)+1)
+	// for i, colIdx := range outerOffset {
+	// 	outerColsMap = append(outerColsMap, colIdx)
+	// 	outerOffset[i] = i
+	// }
+	// joiner.outerTableReader.colsMap = outerColsMap
+	return joiner.probeStreamWithSum(hashtable, innerTable, outerOffset)
 }
 
 func newJoiner(ctx context.Context) *hashJoiner {
