@@ -86,7 +86,7 @@ type tableReader struct {
 }
 
 func newTableReader(ctx context.Context, path string, chunkNum, chunkCap int) *tableReader {
-	tableReader := &tableReader{path: path}
+	tableReader := &tableReader{path: path, colsMap: nil}
 	tableReader.ctx, tableReader.close = context.WithCancel(ctx)
 	tableReader.chunkIn = make(chan *chunk, chunkNum)
 	tableReader.chunkOut = make(chan *chunk, chunkNum)
@@ -96,7 +96,7 @@ func newTableReader(ctx context.Context, path string, chunkNum, chunkCap int) *t
 	return tableReader
 }
 
-func (tableReader *tableReader) read(colsNeed []int) chan *chunk {
+func (tableReader *tableReader) read() chan *chunk {
 	go tableReader.fetchData()
 	return tableReader.chunkOut
 }
@@ -186,7 +186,7 @@ type hashJoiner struct {
 
 // 探测关系元组并返回col0求和结果
 func (joiner *hashJoiner) probeStreamWithSum(hashtable *mvmap.MVMap, innerTable [][][]byte, probeOffset []int) uint64 {
-	chunkCh := joiner.outerTableReader.read(nil)
+	chunkCh := joiner.outerTableReader.read()
 	concurrency := runtime.NumCPU()
 	probeWorkers := make([]*probeWorker, concurrency)
 	var wg sync.WaitGroup
@@ -231,7 +231,7 @@ func (joiner *hashJoiner) probeTblWithSum(hashtable *mvmap.MVMap, innerTable, ou
 
 // 构建散列索引结构
 func (joiner *hashJoiner) build(offset []int) ([][][]byte, *mvmap.MVMap, error) {
-	chunkCh := joiner.innerTableReader.read(nil)
+	chunkCh := joiner.innerTableReader.read()
 	innerTable := make([][][]byte, 0)
 	hashIndex := mvmap.NewMVMap()
 	var keyBuffer []byte
