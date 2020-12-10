@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"runtime"
@@ -14,26 +15,133 @@ import (
 )
 
 type probeWorker struct {
-	rangeCh chan []int
-	closeCh chan bool
-	result  uint64
+	ctx context.Context
+	sum uint64
 }
 
-type hashIndex struct {
-	h []*mvmap.MVMap
+// 探测一行元组
+func _probe(hashtable *mvmap.MVMap, row [][]byte, offset []int) (rowIDs []int64) {
+	var keyHash []byte
+	var vals [][]byte
+	for _, off := range offset {
+		keyHash = append(keyHash, row[off]...)
+	}
+	vals = hashtable.Get(keyHash, vals)
+	for _, val := range vals {
+		rowIDs = append(rowIDs, *(*int64)(unsafe.Pointer(&val[0])))
+	}
+	return rowIDs
+}
+
+func (worker *probeWorker) probeWithSum(hashtable *mvmap.MVMap, innerTable [][][]byte, outerTable [][][]byte, offset []int) {
+	for _, row := range outerTable {
+		rowIDs := _probe(hashtable, row, offset)
+		for _, id := range rowIDs {
+			v, err := strconv.ParseUint(string(innerTable[id][0]), 10, 64)
+			if err != nil {
+				panic("Join panic\n" + err.Error())
+			}
+			worker.sum += v
+		}
+	}
 }
 
 type chunk struct {
 	data   [][][]byte
-	offset int
+	cursor int
 }
 
-func (hi *hashIndex) Get(k []byte) [][]byte {
-	var v [][]byte
-	for _, m := range hi.h {
-		v = m.Get(k, v)
+func newChunk(cap int) *chunk {
+	return &chunk{
+		data:   make([][][]byte, 0, cap),
+		cursor: 0,
 	}
-	return v
+}
+
+func (chunk *chunk) appendRow(row [][]byte) {
+	if len(chunk.data) <= cap(chunk.data) {
+		chunk.data = append(chunk.data, row)
+	} else {
+		chunk.data[chunk.cursor] = row
+	}
+	chunk.cursor++
+}
+
+func (chunk *chunk) reset() {
+	chunk.data = chunk.data[:0]
+	chunk.cursor = 0
+}
+
+func (chunk *chunk) isFull() bool {
+	return chunk.cursor >= cap(chunk.data)
+}
+
+type tableReader struct {
+	ctx      context.Context
+	close    context.CancelFunc
+	path     string
+	chunkIn  chan *chunk
+	chunkOut chan *chunk
+}
+
+func newTableReader(ctx context.Context, path string, chunkNum, chunkCap int) *tableReader {
+	tableReader := &tableReader{path: path}
+	tableReader.ctx, tableReader.close = context.WithCancel(ctx)
+	tableReader.chunkIn = make(chan *chunk, chunkNum)
+	tableReader.chunkOut = make(chan *chunk, chunkNum)
+	for i := 0; i < chunkNum; i++ {
+		tableReader.chunkIn <- newChunk(chunkCap)
+	}
+	return tableReader
+}
+
+func (tableReader *tableReader) read(colsNeed []int) chan *chunk {
+	go func() {
+		defer func() {
+			close(tableReader.chunkOut)
+			tableReader.close()
+		}()
+		csvFile, err := os.Open(tableReader.path)
+		if err != nil {
+			panic(err)
+		}
+		defer csvFile.Close()
+		reader := bufio.NewReader(csvFile)
+		comma := []byte{','}
+		var line []byte
+		chunk := tableReader.borrowChunk()
+		for {
+			select {
+			case <-tableReader.ctx.Done():
+				return
+			default:
+				if chunk.isFull() {
+					tableReader.chunkOut <- chunk
+					chunk = tableReader.borrowChunk()
+				}
+				line, err = reader.ReadBytes('\n')
+				if err == io.EOF {
+					if len(line) > 0 {
+						chunk.appendRow(bytes.Split(line, comma))
+					}
+					tableReader.chunkOut <- chunk
+					return
+				}
+				chunk.appendRow(bytes.Split(line[:len(line)-1], comma))
+			}
+		}
+	}()
+	return tableReader.chunkOut
+}
+
+func (tableReader *tableReader) borrowChunk() *chunk {
+	chunk := <-tableReader.chunkIn
+	chunk.reset()
+	return chunk
+}
+
+func (tableReader *tableReader) releaseChunk(chunk *chunk) {
+	tableReader.chunkIn <- chunk
 }
 
 // Join accepts a join query of two relations, and returns the sum of
@@ -46,211 +154,110 @@ func (hi *hashIndex) Get(k []byte) [][]byte {
 // Output arguments:
 //   sum: sum of relation0.col0 in the final result
 func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
-	var (
-		probeTable  *[][][]byte
-		buildTable  *[][][]byte
-		probeOffset *[]int
-		buildOffset *[]int
-	)
-	// 读取关系表
-	tbl0, tbl1 := readTables(f0, f1)
-	if len(*tbl0) > len(*tbl1) {
-		probeTable = tbl0
-		probeOffset = &offset0
-		buildTable = tbl1
-		buildOffset = &offset1
-	} else {
-		probeTable = tbl1
-		probeOffset = &offset1
-		buildTable = tbl0
-		buildOffset = &offset0
-	}
-	// 构建散列索引结构
-	hashtable := _concurrentBuild(*buildTable, *buildOffset)
-	// 探测并返回求和结果
-	return probeTblWithSum(hashtable, buildTable, probeTable, probeOffset)
+	ctx := context.Background()
+	joiner := newJoiner(ctx)
+	sum = joiner.join(f0, f1, offset0, offset1)
+	return
+}
+
+type hashJoiner struct {
+	ctx              context.Context
+	innerTableReader *tableReader
+	outerTableReader *tableReader
 }
 
 // 探测关系元组并返回col0求和结果
-func probeTblWithSum(hashtable *hashIndex, buildTable *[][][]byte, probeTable *[][][]byte, probeOffset *[]int) uint64 {
+func (joiner *hashJoiner) probeStreamWithSum(hashtable *mvmap.MVMap, innerTable [][][]byte, probeOffset []int) uint64 {
+	chunkCh := joiner.outerTableReader.read(nil)
 	concurrency := runtime.NumCPU()
 	probeWorkers := make([]*probeWorker, concurrency)
 	var wg sync.WaitGroup
-	ch := make(chan []int, 2)
+	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
 		probeWorkers[i] = &probeWorker{
-			rangeCh: ch,
-			closeCh: make(chan bool),
-			result:  uint64(0),
+			ctx: joiner.ctx,
+			sum: uint64(0),
 		}
 		go func(w *probeWorker) {
+			defer wg.Done()
 			for {
 				select {
-				case ran := <-w.rangeCh:
-					for _, row := range (*probeTable)[ran[0]:ran[1]] {
-						rowIDs := _probe(hashtable, row, *probeOffset)
-						for _, id := range rowIDs {
-							v, err := strconv.ParseUint(string((*buildTable)[id][0]), 10, 64)
-							if err != nil {
-								panic("Join panic\n" + err.Error())
-							}
-							w.result += v
-						}
-					}
-					wg.Done()
-				case <-w.closeCh:
+				case <-w.ctx.Done():
 					return
+				case chunk := <-chunkCh:
+					if chunk == nil {
+						return
+					}
+					w.probeWithSum(hashtable, innerTable, chunk.data, probeOffset)
+					joiner.outerTableReader.releaseChunk(chunk)
 				}
 			}
 		}(probeWorkers[i])
 	}
-	// 增加探测任务数量，提升探测任务执行快情景下的速度，使多核上的调度更加均衡
-	threshold := len(*probeTable) / concurrency / 4
-	if threshold < 1 {
-		threshold = 1
-	}
-	var end int
-	for j := 0; j < len(*probeTable); {
-		end = j + threshold
-		if len(*probeTable) < end {
-			end = len(*probeTable)
-		}
-		wg.Add(1)
-		ch <- []int{j, end}
-		j = end
-	}
 	wg.Wait()
-
 	sum := uint64(0)
 	for _, w := range probeWorkers {
-		sum += w.result
-		w.closeCh <- true
+		sum += w.sum
 	}
-
 	return sum
 }
 
-// 读取CSV文件内容并解析
-func readCSV(filepath string) [][][]byte {
-	csvFile, _ := os.Open(filepath)
-	defer csvFile.Close()
-	reader := bufio.NewReader(csvFile)
-	comma := []byte{','}
-	var tbl [][][]byte
-	var line []byte
+func (joiner *hashJoiner) probeTblWithSum(hashtable *mvmap.MVMap, innerTable, outerTable [][][]byte, probeOffset []int) uint64 {
+	worker := &probeWorker{
+		ctx: joiner.ctx,
+		sum: uint64(0),
+	}
+	worker.probeWithSum(hashtable, innerTable, outerTable, probeOffset)
+	return worker.sum
+}
+
+// 构建散列索引结构
+func (joiner *hashJoiner) build(offset []int) ([][][]byte, *mvmap.MVMap, error) {
+	chunkCh := joiner.innerTableReader.read(nil)
+	innerTable := make([][][]byte, 0)
+	hashIndex := mvmap.NewMVMap()
+	var keyBuffer []byte
+	valBuffer := make([]byte, 8)
+	var id int
 	var err error
-
+loop:
 	for {
-		line, err = reader.ReadBytes('\n')
-		if err == io.EOF {
-			if len(line) > 0 {
-				tbl = append(tbl, bytes.Split(line, comma))
+		select {
+		case <-joiner.ctx.Done():
+			break loop
+		case chunk := <-chunkCh:
+			if chunk == nil {
+				break loop
 			}
-			break
-		}
-		tbl = append(tbl, bytes.Split(line[:len(line)-1], comma))
-	}
-
-	return tbl
-}
-
-//
-func readTables(tbl0Path, tbl1Path string) (*[][][]byte, *[][][]byte) {
-	if tbl0Path == tbl1Path {
-		tbl0 := readCSV(tbl0Path)
-		return &tbl0, &tbl0
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	var tbl0, tbl1 [][][]byte
-	go func() {
-		defer wg.Done()
-		tbl0 = readCSV(tbl0Path)
-	}()
-	go func() {
-		defer wg.Done()
-		tbl1 = readCSV(tbl1Path)
-	}()
-	wg.Wait()
-
-	return &tbl0, &tbl1
-}
-
-// （并发）构建散列索引结构
-func _concurrentBuild(data [][][]byte, offset []int) *hashIndex {
-	wg := new(sync.WaitGroup)
-	concurrency := runtime.NumCPU()
-	hashIndex := &hashIndex{
-		h: make([]*mvmap.MVMap, concurrency),
-	}
-	for n := range hashIndex.h {
-		hashIndex.h[n] = mvmap.NewMVMap()
-	}
-	chunkCh := make(chan *chunk, concurrency)
-	closeCh := make(chan bool)
-	// 创建workers
-	for i := 0; i < concurrency; i++ {
-		go func(id int) {
-			var keyBuffer []byte
-			valBuffer := make([]byte, 8)
-			for {
-				select {
-				case chunk := <-chunkCh:
-					for i, row := range chunk.data {
-						for _, off := range offset {
-							keyBuffer = append(keyBuffer, row[off]...)
-						}
-						*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(chunk.offset + i)
-						hashIndex.h[id].Put(keyBuffer, valBuffer)
-						keyBuffer = keyBuffer[:0]
-					}
-					wg.Done()
-				case <-closeCh:
-					return
+			innerTable = append(innerTable, chunk.data...)
+			for _, row := range chunk.data {
+				for _, off := range offset {
+					keyBuffer = append(keyBuffer, row[off]...)
 				}
+				*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(id)
+				hashIndex.Put(keyBuffer, valBuffer)
+				keyBuffer = keyBuffer[:0]
+				id++
 			}
-		}(i)
-	}
-	// 产生任务
-	chunkSize := len(data) / concurrency
-	if chunkSize < 1 {
-		chunkSize = 1
-	}
-	end := 0
-	for j := 0; j < len(data); {
-		end += chunkSize
-		if end > len(data) {
-			end = len(data)
+			joiner.innerTableReader.releaseChunk(chunk)
 		}
-		wg.Add(1)
-		go func(s, e int) {
-			chunkCh <- &chunk{
-				data:   data[s:e],
-				offset: s,
-			}
-		}(j, end)
-		j = end
 	}
-	wg.Wait()
-	// 关闭workers
-	for i := 0; i < concurrency; i++ {
-		closeCh <- true
-	}
-
-	return hashIndex
+	return innerTable, hashIndex, err
 }
 
-// 探测一行元组
-func _probe(hashtable *hashIndex, row [][]byte, offset []int) (rowIDs []int64) {
-	var keyHash []byte
-	// var vals [][]byte
-	for _, off := range offset {
-		keyHash = append(keyHash, row[off]...)
+func (joiner *hashJoiner) join(innerTablePath, outerTablePath string, innerOffset, outerOffset []int) uint64 {
+	joiner.innerTableReader = newTableReader(joiner.ctx, innerTablePath, 10, 1000)
+	innerTable, hashtable, err := joiner.build(innerOffset)
+	if err != nil {
+		panic(err)
 	}
-	vals := hashtable.Get(keyHash)
-	for _, val := range vals {
-		rowIDs = append(rowIDs, *(*int64)(unsafe.Pointer(&val[0])))
+	if innerTablePath != outerTablePath {
+		joiner.outerTableReader = newTableReader(joiner.ctx, outerTablePath, 10*runtime.NumCPU(), 1000)
+		return joiner.probeStreamWithSum(hashtable, innerTable, outerOffset)
 	}
-	return rowIDs
+	return joiner.probeTblWithSum(hashtable, innerTable, innerTable, outerOffset)
+}
+
+func newJoiner(ctx context.Context) *hashJoiner {
+	return &hashJoiner{ctx: ctx}
 }

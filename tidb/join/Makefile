@@ -9,4 +9,4 @@ bench:
 	go test -bench Benchmark -run xx -count 5 -benchmem
 
 trace:
-	go test -bench BenchmarkForTrace -run xx -count 5 -benchmem --cpuprofile=cpu --memprofile=mem --blockprofile=block --trace=trace.out
+	go test -bench BenchmarkJoin -run xx -count 3 -benchmem --cpuprofile=cpu --memprofile=mem --blockprofile=block --trace=trace.out
