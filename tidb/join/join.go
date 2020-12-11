@@ -302,7 +302,7 @@ loop:
 }
 
 func (joiner *hashJoiner) joinSelf(innerTablePath string, innerOffset, outerOffset []int) uint64 {
-	joiner.innerTableReader.colsMap = _mergeCols(_mergeCols([]int{0}, innerOffset), outerOffset)
+	joiner.innerTableReader.colsMap = _mergeCols(innerOffset, outerOffset)
 	joiner.outerTableReader = joiner.innerTableReader
 	innerTable, hashtable, err := joiner.build(innerOffset)
 	if err != nil {
@@ -320,6 +320,7 @@ func (joiner *hashJoiner) join(innerTablePath, outerTablePath string, innerOffse
 	if err != nil {
 		panic(err)
 	}
+	innerOffset = _mergeCols([]int{0}, innerOffset)
 	// inner表用与build hashtable，越小越好
 	if innerStat.Size() > outerStat.Size() {
 		innerTablePath, outerTablePath = outerTablePath, innerTablePath
@@ -331,13 +332,13 @@ func (joiner *hashJoiner) join(innerTablePath, outerTablePath string, innerOffse
 	if innerTablePath == outerTablePath {
 		return joiner.joinSelf(innerTablePath, innerOffset, outerOffset)
 	}
-	joiner.innerTableReader.colsMap = _mergeCols([]int{0}, innerOffset)
+	joiner.innerTableReader.colsMap = innerOffset
 	innerTable, hashtable, err := joiner.build(innerOffset)
 	if err != nil {
 		panic(err)
 	}
 	joiner.outerTableReader = newTableReader(joiner.ctx, outerTablePath, runtime.NumCPU(), 1000)
-	joiner.outerTableReader.colsMap = _mergeCols([]int{0}, outerOffset)
+	joiner.outerTableReader.colsMap = outerOffset
 	return joiner.probeStreamWithSum(hashtable, innerTable, outerOffset)
 }
 
