@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -14,17 +15,38 @@ import (
 	"github.com/pingcap/tidb/util/mvmap"
 )
 
+func _mergeCols(parentNeed, selfNeed []int) []int {
+	colsNeed := make([]int, len(parentNeed), len(parentNeed)+len(selfNeed))
+	copy(colsNeed, parentNeed)
+	contain := func(i int, arr []int) bool {
+		for j := 0; j < len(arr); j++ {
+			if i == arr[j] {
+				return true
+			}
+		}
+		return false
+	}
+	for _, selfCol := range selfNeed {
+		if !contain(selfCol, parentNeed) {
+			colsNeed = append(colsNeed, selfCol)
+		}
+	}
+	return colsNeed
+}
+
 type probeWorker struct {
-	ctx context.Context
-	sum uint64
+	ctx        context.Context
+	outerTable *tableReader
+	sumTable   *tableReader
+	sum        uint64
 }
 
 // 探测一行元组
-func _probe(hashtable *mvmap.MVMap, row [][]byte, offset []int) (rowIDs []int64) {
+func (worker *probeWorker) probeOneRow(hashtable *mvmap.MVMap, row [][]byte, offset []int) (rowIDs []int64) {
 	var keyHash []byte
 	var vals [][]byte
 	for _, off := range offset {
-		keyHash = append(keyHash, row[off]...)
+		keyHash = append(keyHash, worker.outerTable.getColumn(row, off)...)
 	}
 	vals = hashtable.Get(keyHash, vals)
 	for _, val := range vals {
@@ -35,9 +57,9 @@ func _probe(hashtable *mvmap.MVMap, row [][]byte, offset []int) (rowIDs []int64)
 
 func (worker *probeWorker) probeWithSum(hashtable *mvmap.MVMap, innerTable [][][]byte, outerTable [][][]byte, offset []int) {
 	for _, row := range outerTable {
-		rowIDs := _probe(hashtable, row, offset)
+		rowIDs := worker.probeOneRow(hashtable, row, offset)
 		for _, id := range rowIDs {
-			v, err := strconv.ParseUint(string(innerTable[id][0]), 10, 64)
+			v, err := strconv.ParseUint(string(worker.sumTable.getColumn(innerTable[id], 0)), 10, 64)
 			if err != nil {
 				panic("Join panic\n" + err.Error())
 			}
@@ -86,7 +108,7 @@ type tableReader struct {
 }
 
 func newTableReader(ctx context.Context, path string, chunkNum, chunkCap int) *tableReader {
-	tableReader := &tableReader{path: path, colsMap: nil}
+	tableReader := &tableReader{path: path}
 	tableReader.ctx, tableReader.close = context.WithCancel(ctx)
 	tableReader.chunkIn = make(chan *chunk, chunkNum)
 	tableReader.chunkOut = make(chan *chunk, chunkNum)
@@ -107,9 +129,11 @@ func (tableReader *tableReader) readRow(rawRow []byte, sep byte, chunk *chunk) {
 		if tableReader.colsMap != nil {
 			for i := 0; i < len(row); i++ {
 				for newIdx, oldIdx := range tableReader.colsMap {
-					row[i][newIdx], row[i][oldIdx] = row[i][oldIdx], row[i][newIdx]
+					if newIdx != oldIdx {
+						row[newIdx], row[oldIdx] = row[oldIdx], row[newIdx]
+					}
 				}
-				row[i] = row[i][:len(tableReader.colsMap)]
+				row = row[:len(tableReader.colsMap)]
 			}
 		}
 		chunk.appendRow(row)
@@ -162,26 +186,28 @@ func (tableReader *tableReader) releaseChunk(chunk *chunk) {
 	tableReader.chunkIn <- chunk
 }
 
-// Join accepts a join query of two relations, and returns the sum of
-// relation0.col0 in the final result.
-// Input arguments:
-//   f0: file name of the given relation0
-//   f1: file name of the given relation1
-//   offset0: offsets of which columns the given relation0 should be joined
-//   offset1: offsets of which columns the given relation1 should be joined
-// Output arguments:
-//   sum: sum of relation0.col0 in the final result
-func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
-	ctx := context.Background()
-	joiner := newJoiner(ctx)
-	sum = joiner.join(f0, f1, offset0, offset1)
-	return
+func (tableReader *tableReader) getColumn(row [][]byte, colIdx int) []byte {
+	if tableReader.colsMap == nil {
+		return row[colIdx]
+	}
+	find := -1
+	for i := 0; i < len(tableReader.colsMap); i++ {
+		if tableReader.colsMap[i] == colIdx {
+			find = i
+			break
+		}
+	}
+	if find == -1 || find >= len(row) {
+		panic(fmt.Sprintf("Can't find column[%d] in map %v", colIdx, tableReader.colsMap))
+	}
+	return row[find]
 }
 
 type hashJoiner struct {
 	ctx              context.Context
 	innerTableReader *tableReader
 	outerTableReader *tableReader
+	swap             bool
 }
 
 // 探测关系元组并返回col0求和结果
@@ -193,8 +219,14 @@ func (joiner *hashJoiner) probeStreamWithSum(hashtable *mvmap.MVMap, innerTable 
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
 		probeWorkers[i] = &probeWorker{
-			ctx: joiner.ctx,
-			sum: uint64(0),
+			ctx:        joiner.ctx,
+			outerTable: joiner.outerTableReader,
+			sum:        uint64(0),
+		}
+		if joiner.swap {
+			probeWorkers[i].sumTable = joiner.outerTableReader
+		} else {
+			probeWorkers[i].sumTable = joiner.innerTableReader
 		}
 		go func(w *probeWorker) {
 			defer wg.Done()
@@ -222,8 +254,14 @@ func (joiner *hashJoiner) probeStreamWithSum(hashtable *mvmap.MVMap, innerTable 
 
 func (joiner *hashJoiner) probeTblWithSum(hashtable *mvmap.MVMap, innerTable, outerTable [][][]byte, probeOffset []int) uint64 {
 	worker := &probeWorker{
-		ctx: joiner.ctx,
-		sum: uint64(0),
+		ctx:        joiner.ctx,
+		outerTable: joiner.outerTableReader,
+		sum:        uint64(0),
+	}
+	if joiner.swap {
+		worker.sumTable = joiner.outerTableReader
+	} else {
+		worker.sumTable = joiner.innerTableReader
 	}
 	worker.probeWithSum(hashtable, innerTable, outerTable, probeOffset)
 	return worker.sum
@@ -250,7 +288,7 @@ loop:
 			innerTable = append(innerTable, chunk.data...)
 			for _, row := range chunk.data {
 				for _, off := range offset {
-					keyBuffer = append(keyBuffer, row[off]...)
+					keyBuffer = append(keyBuffer, joiner.innerTableReader.getColumn(row, off)...)
 				}
 				*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(id)
 				hashIndex.Put(keyBuffer, valBuffer)
@@ -264,26 +302,8 @@ loop:
 }
 
 func (joiner *hashJoiner) joinSelf(innerTablePath string, innerOffset, outerOffset []int) uint64 {
-	// innerColsMap := make([]int, 0, len(innerOffset)+len(outerOffset))
-	// for i, colIdx := range innerOffset {
-	// 	innerColsMap = append(innerColsMap, colIdx)
-	// 	innerOffset[i] = i
-	// }
-	// for i, outerColIdx := range outerOffset {
-	// 	find := false
-	// 	for j, colIdx := range innerColsMap {
-	// 		if colIdx == outerColIdx {
-	// 			find = true
-	// 			outerOffset[i] = j
-	// 			break
-	// 		}
-	// 	}
-	// 	if !find {
-	// 		innerColsMap = append(innerColsMap, outerColIdx)
-	// 		outerOffset[i] = len(innerColsMap)
-	// 	}
-	// }
-	// joiner.innerTableReader.colsMap = innerColsMap
+	joiner.innerTableReader.colsMap = _mergeCols(_mergeCols([]int{0}, innerOffset), outerOffset)
+	joiner.outerTableReader = joiner.innerTableReader
 	innerTable, hashtable, err := joiner.build(innerOffset)
 	if err != nil {
 		panic(err)
@@ -292,44 +312,51 @@ func (joiner *hashJoiner) joinSelf(innerTablePath string, innerOffset, outerOffs
 }
 
 func (joiner *hashJoiner) join(innerTablePath, outerTablePath string, innerOffset, outerOffset []int) uint64 {
-	// innerStat, err := os.Stat(innerTablePath)
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// outerStat, err := os.Stat(outerTablePath)
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// // inner表用与build hashtable，越小越好
-	// if innerStat.Size() > outerStat.Size() {
-	// 	innerTablePath, outerTablePath = outerTablePath, innerTablePath
-	// 	innerOffset, outerOffset = outerOffset, innerOffset
-	// }
+	innerStat, err := os.Stat(innerTablePath)
+	if err != nil {
+		panic(err)
+	}
+	outerStat, err := os.Stat(outerTablePath)
+	if err != nil {
+		panic(err)
+	}
+	// inner表用与build hashtable，越小越好
+	if innerStat.Size() > outerStat.Size() {
+		innerTablePath, outerTablePath = outerTablePath, innerTablePath
+		innerOffset, outerOffset = outerOffset, innerOffset
+		joiner.swap = true
+	}
 	joiner.innerTableReader = newTableReader(joiner.ctx, innerTablePath, 1, runtime.NumCPU()*1000)
 	// 相同表不重复读
 	if innerTablePath == outerTablePath {
 		return joiner.joinSelf(innerTablePath, innerOffset, outerOffset)
 	}
-	// innerColsMap := make([]int, 0, len(innerOffset)+1)
-	// for i, colIdx := range innerOffset {
-	// 	innerColsMap = append(innerColsMap, colIdx)
-	// 	innerOffset[i] = i
-	// }
-	// joiner.innerTableReader.colsMap = innerColsMap
+	joiner.innerTableReader.colsMap = _mergeCols([]int{0}, innerOffset)
 	innerTable, hashtable, err := joiner.build(innerOffset)
 	if err != nil {
 		panic(err)
 	}
 	joiner.outerTableReader = newTableReader(joiner.ctx, outerTablePath, runtime.NumCPU(), 1000)
-	// outerColsMap := make([]int, 0, len(innerOffset)+1)
-	// for i, colIdx := range outerOffset {
-	// 	outerColsMap = append(outerColsMap, colIdx)
-	// 	outerOffset[i] = i
-	// }
-	// joiner.outerTableReader.colsMap = outerColsMap
+	joiner.outerTableReader.colsMap = _mergeCols([]int{0}, outerOffset)
 	return joiner.probeStreamWithSum(hashtable, innerTable, outerOffset)
 }
 
 func newJoiner(ctx context.Context) *hashJoiner {
 	return &hashJoiner{ctx: ctx}
+}
+
+// Join accepts a join query of two relations, and returns the sum of
+// relation0.col0 in the final result.
+// Input arguments:
+//   f0: file name of the given relation0
+//   f1: file name of the given relation1
+//   offset0: offsets of which columns the given relation0 should be joined
+//   offset1: offsets of which columns the given relation1 should be joined
+// Output arguments:
+//   sum: sum of relation0.col0 in the final result
+func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
+	ctx := context.Background()
+	joiner := newJoiner(ctx)
+	sum = joiner.join(f0, f1, offset0, offset1)
+	return
 }
