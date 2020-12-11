@@ -5,7 +5,6 @@ import (
 	"os"
 	"runtime"
 	"strconv"
-	"sync"
 	"unsafe"
 
 	"github.com/pingcap/tidb/util/mvmap"
@@ -31,10 +30,14 @@ func _mergeCols(parentNeed, selfNeed []int) []int {
 }
 
 type probeWorker struct {
-	ctx        context.Context
-	outerTable *tableReader
-	sumTable   *tableReader
-	sum        uint64
+	ctx            context.Context
+	hashtable      *mvmap.MVMap
+	innerTableData [][][]byte
+	outerTable     *tableReader
+	probeCols      []int
+	sumTable       *tableReader
+	sum            uint64
+	quit           chan struct{}
 }
 
 // 探测一行元组
@@ -64,6 +67,54 @@ func (worker *probeWorker) probeWithSum(hashtable *mvmap.MVMap, innerTable [][][
 	}
 }
 
+func (worker *probeWorker) run(chunkCh chan *chunk) {
+	defer worker.close()
+	for {
+		select {
+		case <-worker.ctx.Done():
+			return
+		case chunk := <-chunkCh:
+			if chunk == nil {
+				return
+			}
+			worker.probeWithSum(worker.hashtable, worker.innerTableData, chunk.data, worker.probeCols)
+			worker.outerTable.releaseChunk(chunk)
+		}
+	}
+}
+
+func (worker *probeWorker) runSerial(outerTableData [][][]byte) {
+	defer worker.close()
+	select {
+	case <-worker.ctx.Done():
+		return
+	default:
+		worker.probeWithSum(worker.hashtable, worker.innerTableData, outerTableData, worker.probeCols)
+		return
+	}
+}
+
+func (worker *probeWorker) close() {
+	worker.quit <- struct{}{}
+}
+
+func (worker *probeWorker) getSum() uint64 {
+	<-worker.quit
+	return worker.sum
+}
+
+func newProbeWorker(ctx context.Context, hashtable *mvmap.MVMap, innerTableData [][][]byte, outerTable *tableReader, probeCols []int) *probeWorker {
+	return &probeWorker{
+		ctx:            ctx,
+		hashtable:      hashtable,
+		innerTableData: innerTableData,
+		outerTable:     outerTable,
+		probeCols:      probeCols,
+		sum:            uint64(0),
+		quit:           make(chan struct{}),
+	}
+}
+
 type hashJoiner struct {
 	ctx              context.Context
 	innerTableReader *tableReader
@@ -75,57 +126,56 @@ type hashJoiner struct {
 func (joiner *hashJoiner) probeStreamWithSum(hashtable *mvmap.MVMap, innerTable [][][]byte, probeOffset []int) uint64 {
 	chunkCh := joiner.outerTableReader.read()
 	concurrency := runtime.NumCPU()
-	probeWorkers := make([]*probeWorker, concurrency)
-	var wg sync.WaitGroup
-	wg.Add(concurrency)
+	probeWorkers := make([]*probeWorker, 0, concurrency)
 	for i := 0; i < concurrency; i++ {
-		probeWorkers[i] = &probeWorker{
-			ctx:        joiner.ctx,
-			outerTable: joiner.outerTableReader,
-			sum:        uint64(0),
-		}
+		worker := newProbeWorker(joiner.ctx, hashtable, innerTable, joiner.outerTableReader, probeOffset)
+		// 这个设计不是很好
 		if joiner.swap {
-			probeWorkers[i].sumTable = joiner.outerTableReader
+			worker.sumTable = joiner.outerTableReader
 		} else {
-			probeWorkers[i].sumTable = joiner.innerTableReader
+			worker.sumTable = joiner.innerTableReader
 		}
-		go func(w *probeWorker) {
-			defer wg.Done()
-			for {
-				select {
-				case <-w.ctx.Done():
-					return
-				case chunk := <-chunkCh:
-					if chunk == nil {
-						return
-					}
-					w.probeWithSum(hashtable, innerTable, chunk.data, probeOffset)
-					joiner.outerTableReader.releaseChunk(chunk)
-				}
-			}
-		}(probeWorkers[i])
+		probeWorkers = append(probeWorkers, worker)
+		go worker.run(chunkCh)
 	}
-	wg.Wait()
-	sum := uint64(0)
+	var sum uint64
 	for _, w := range probeWorkers {
-		sum += w.sum
+		sum += w.getSum()
 	}
 	return sum
 }
 
 func (joiner *hashJoiner) probeTblWithSum(hashtable *mvmap.MVMap, innerTable, outerTable [][][]byte, probeOffset []int) uint64 {
-	worker := &probeWorker{
-		ctx:        joiner.ctx,
-		outerTable: joiner.outerTableReader,
-		sum:        uint64(0),
+	// worker := &probeWorker{
+	// 	ctx:        joiner.ctx,
+	// 	outerTable: joiner.outerTableReader,
+	// 	sum:        uint64(0),
+	// }
+	// if joiner.swap {
+	// 	worker.sumTable = joiner.outerTableReader
+	// } else {
+	// 	worker.sumTable = joiner.innerTableReader
+	// }
+	// worker.probeWithSum(hashtable, innerTable, outerTable, probeOffset)
+	// return worker.sum
+	concurrency := runtime.NumCPU()
+	probeWorkers := make([]*probeWorker, 0, concurrency)
+	for i := 0; i < concurrency; i++ {
+		worker := newProbeWorker(joiner.ctx, hashtable, innerTable, joiner.outerTableReader, probeOffset)
+		// 这个设计不是很好，原因是需要outerTableReader resolve column index, 也许可以再写一个resolver
+		if joiner.swap {
+			worker.sumTable = joiner.outerTableReader
+		} else {
+			worker.sumTable = joiner.innerTableReader
+		}
+		probeWorkers = append(probeWorkers, worker)
+		go worker.runSerial(outerTable)
 	}
-	if joiner.swap {
-		worker.sumTable = joiner.outerTableReader
-	} else {
-		worker.sumTable = joiner.innerTableReader
+	var sum uint64
+	for _, w := range probeWorkers {
+		sum += w.getSum()
 	}
-	worker.probeWithSum(hashtable, innerTable, outerTable, probeOffset)
-	return worker.sum
+	return sum
 }
 
 // 构建散列索引结构
