@@ -34,8 +34,8 @@ type probeWorker struct {
 	hashtable      *mvmap.MVMap
 	innerTableData [][][]byte
 	outerTable     *tableReader
+	resolver       *columnResolver
 	probeCols      []int
-	sumTable       *tableReader
 	sum            uint64
 	quit           chan struct{}
 }
@@ -57,13 +57,21 @@ func (worker *probeWorker) probeOneRow(hashtable *mvmap.MVMap, row [][]byte, off
 func (worker *probeWorker) probeWithSum(hashtable *mvmap.MVMap, innerTable [][][]byte, outerTable [][][]byte, offset []int) {
 	for _, row := range outerTable {
 		rowIDs := worker.probeOneRow(hashtable, row, offset)
+
 		for _, id := range rowIDs {
-			v, err := strconv.ParseUint(string(worker.sumTable.getColumn(innerTable[id], 0)), 10, 64)
+			v, err := strconv.ParseUint(string(worker.resolver.resolve(innerTable[id], 0)), 10, 64)
 			if err != nil {
 				panic("Join panic\n" + err.Error())
 			}
 			worker.sum += v
 		}
+
+		// v, err := strconv.ParseUint(string(worker.sumTable.getColumn(row, 0)), 10, 64)
+		// if err != nil {
+		// 	panic("Join panic\n" + err.Error())
+		// }
+		// worker.sum += uint64(len(rowIDs)) * v
+
 	}
 }
 
@@ -103,12 +111,12 @@ func (worker *probeWorker) getSum() uint64 {
 	return worker.sum
 }
 
-func newProbeWorker(ctx context.Context, hashtable *mvmap.MVMap, innerTableData [][][]byte, outerTable *tableReader, probeCols []int) *probeWorker {
+func newProbeWorker(ctx context.Context, hashtable *mvmap.MVMap, innerTableData [][][]byte, resolver *columnResolver, probeCols []int) *probeWorker {
 	return &probeWorker{
 		ctx:            ctx,
 		hashtable:      hashtable,
 		innerTableData: innerTableData,
-		outerTable:     outerTable,
+		resolver:       resolver,
 		probeCols:      probeCols,
 		sum:            uint64(0),
 		quit:           make(chan struct{}),
@@ -119,22 +127,25 @@ type hashJoiner struct {
 	ctx              context.Context
 	innerTableReader *tableReader
 	outerTableReader *tableReader
-	swap             bool
+	innerOn          []int
+	outerOn          []int
+	optimized        bool
+	selfJoin         bool
 }
 
 // 探测关系元组并返回col0求和结果
-func (joiner *hashJoiner) probeStreamWithSum(hashtable *mvmap.MVMap, innerTable [][][]byte, probeOffset []int) uint64 {
+func (joiner *hashJoiner) probeStreamWithSum(hashtable *mvmap.MVMap, innerTable [][][]byte) uint64 {
 	chunkCh := joiner.outerTableReader.read()
 	concurrency := runtime.NumCPU()
 	probeWorkers := make([]*probeWorker, 0, concurrency)
 	for i := 0; i < concurrency; i++ {
-		worker := newProbeWorker(joiner.ctx, hashtable, innerTable, joiner.outerTableReader, probeOffset)
-		// 这个设计不是很好
-		if joiner.swap {
-			worker.sumTable = joiner.outerTableReader
+		var resolver *columnResolver
+		if joiner.optimized {
+			resolver = joiner.outerTableReader.columnResolver
 		} else {
-			worker.sumTable = joiner.innerTableReader
+			resolver = joiner.innerTableReader.columnResolver
 		}
+		worker := newProbeWorker(joiner.ctx, hashtable, innerTable, resolver, joiner.outerOn)
 		probeWorkers = append(probeWorkers, worker)
 		go worker.run(chunkCh)
 	}
@@ -145,31 +156,27 @@ func (joiner *hashJoiner) probeStreamWithSum(hashtable *mvmap.MVMap, innerTable 
 	return sum
 }
 
-func (joiner *hashJoiner) probeTblWithSum(hashtable *mvmap.MVMap, innerTable, outerTable [][][]byte, probeOffset []int) uint64 {
-	// worker := &probeWorker{
-	// 	ctx:        joiner.ctx,
-	// 	outerTable: joiner.outerTableReader,
-	// 	sum:        uint64(0),
-	// }
-	// if joiner.swap {
-	// 	worker.sumTable = joiner.outerTableReader
-	// } else {
-	// 	worker.sumTable = joiner.innerTableReader
-	// }
-	// worker.probeWithSum(hashtable, innerTable, outerTable, probeOffset)
-	// return worker.sum
+func (joiner *hashJoiner) probeTblWithSum(hashtable *mvmap.MVMap, innerTable, outerTable [][][]byte) uint64 {
 	concurrency := runtime.NumCPU()
 	probeWorkers := make([]*probeWorker, 0, concurrency)
+	chunkSize := len(outerTable) / concurrency
 	for i := 0; i < concurrency; i++ {
-		worker := newProbeWorker(joiner.ctx, hashtable, innerTable, joiner.outerTableReader, probeOffset)
-		// 这个设计不是很好，原因是需要outerTableReader resolve column index, 也许可以再写一个resolver
-		if joiner.swap {
-			worker.sumTable = joiner.outerTableReader
+		var resolver *columnResolver
+		if joiner.selfJoin {
+			resolver = joiner.innerTableReader.columnResolver
+		} else if joiner.optimized {
+			resolver = joiner.outerTableReader.columnResolver
 		} else {
-			worker.sumTable = joiner.innerTableReader
+			resolver = joiner.innerTableReader.columnResolver
 		}
+		worker := newProbeWorker(joiner.ctx, hashtable, innerTable, resolver, joiner.outerOn)
 		probeWorkers = append(probeWorkers, worker)
-		go worker.runSerial(outerTable)
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(outerTable) {
+			end = len(outerTable)
+		}
+		go worker.runSerial(outerTable[start:end])
 	}
 	var sum uint64
 	for _, w := range probeWorkers {
@@ -179,7 +186,7 @@ func (joiner *hashJoiner) probeTblWithSum(hashtable *mvmap.MVMap, innerTable, ou
 }
 
 // 构建散列索引结构
-func (joiner *hashJoiner) build(offset []int) ([][][]byte, *mvmap.MVMap, error) {
+func (joiner *hashJoiner) build() ([][][]byte, *mvmap.MVMap, error) {
 	chunkCh := joiner.innerTableReader.read()
 	innerTable := make([][][]byte, 0)
 	hashIndex := mvmap.NewMVMap()
@@ -198,7 +205,7 @@ loop:
 			}
 			innerTable = append(innerTable, chunk.data...)
 			for _, row := range chunk.data {
-				for _, off := range offset {
+				for _, off := range joiner.innerOn {
 					keyBuffer = append(keyBuffer, joiner.innerTableReader.getColumn(row, off)...)
 				}
 				*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(id)
@@ -212,47 +219,59 @@ loop:
 	return innerTable, hashIndex, err
 }
 
-func (joiner *hashJoiner) joinSelf(innerTablePath string, innerOffset, outerOffset []int) uint64 {
-	joiner.innerTableReader.colsMap = _mergeCols(innerOffset, outerOffset)
-	joiner.outerTableReader = joiner.innerTableReader
-	innerTable, hashtable, err := joiner.build(innerOffset)
+func (joiner *hashJoiner) optimize() {
+	if joiner.innerTableReader.path == joiner.outerTableReader.path {
+		colsMap := _mergeCols(_mergeCols([]int{0}, joiner.innerOn), joiner.outerOn)
+		joiner.innerTableReader.columnResolver = newColumnResolver(colsMap)
+		joiner.outerTableReader = nil
+		joiner.optimized = true
+		joiner.selfJoin = true
+		return
+	}
+	innerStat, err := os.Stat(joiner.innerTableReader.path)
 	if err != nil {
 		panic(err)
 	}
-	return joiner.probeTblWithSum(hashtable, innerTable, innerTable, outerOffset)
-}
-
-func (joiner *hashJoiner) join(innerTablePath, outerTablePath string, innerOffset, outerOffset []int) uint64 {
-	innerStat, err := os.Stat(innerTablePath)
+	outerStat, err := os.Stat(joiner.outerTableReader.path)
 	if err != nil {
 		panic(err)
 	}
-	outerStat, err := os.Stat(outerTablePath)
-	if err != nil {
-		panic(err)
-	}
-	innerOffset = _mergeCols([]int{0}, innerOffset)
 	// inner表用与build hashtable，越小越好
 	if innerStat.Size() > outerStat.Size() {
-		innerTablePath, outerTablePath = outerTablePath, innerTablePath
-		innerOffset, outerOffset = outerOffset, innerOffset
-		joiner.swap = true
+		joiner.innerTableReader.columnResolver = newColumnResolver(_mergeCols([]int{0}, joiner.innerOn))
+		joiner.outerTableReader.columnResolver = newColumnResolver(joiner.outerOn)
+		joiner.innerTableReader, joiner.outerTableReader = joiner.outerTableReader, joiner.innerTableReader
+		joiner.innerOn, joiner.outerOn = joiner.outerOn, joiner.innerOn
+		joiner.optimized = true
 	}
-	joiner.innerTableReader = newTableReader(joiner.ctx, innerTablePath, 1, runtime.NumCPU()*1000)
-	// 相同表不重复读
-	if innerTablePath == outerTablePath {
-		return joiner.joinSelf(innerTablePath, innerOffset, outerOffset)
-	}
-	joiner.innerTableReader.colsMap = innerOffset
-	innerTable, hashtable, err := joiner.build(innerOffset)
+}
+
+func (joiner *hashJoiner) joinSelf() uint64 {
+	innerTable, hashtable, err := joiner.build()
 	if err != nil {
 		panic(err)
 	}
-	joiner.outerTableReader = newTableReader(joiner.ctx, outerTablePath, runtime.NumCPU(), 1000)
-	joiner.outerTableReader.colsMap = outerOffset
-	return joiner.probeStreamWithSum(hashtable, innerTable, outerOffset)
+	return joiner.probeTblWithSum(hashtable, innerTable, innerTable)
 }
 
-func newJoiner(ctx context.Context) *hashJoiner {
-	return &hashJoiner{ctx: ctx}
+func (joiner *hashJoiner) join() uint64 {
+	joiner.optimize()
+	if joiner.selfJoin {
+		return joiner.joinSelf()
+	}
+	innerTable, hashtable, err := joiner.build()
+	if err != nil {
+		panic(err)
+	}
+	return joiner.probeStreamWithSum(hashtable, innerTable)
+}
+
+func newJoiner(ctx context.Context, innerTablePath, outerTablePath string, innerOffset, outerOffset []int) *hashJoiner {
+	return &hashJoiner{
+		ctx:              ctx,
+		innerTableReader: newTableReader(ctx, innerTablePath, 1, runtime.NumCPU()*1000),
+		innerOn:          innerOffset,
+		outerTableReader: newTableReader(ctx, outerTablePath, runtime.NumCPU(), 1000),
+		outerOn:          outerOffset,
+	}
 }

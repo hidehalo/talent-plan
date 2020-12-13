@@ -9,18 +9,44 @@ import (
 	"os"
 )
 
+type columnResolver struct {
+	colsMap []int
+}
+
+func (resolver *columnResolver) resolve(row [][]byte, colIdx int) []byte {
+	if resolver.colsMap == nil {
+		return row[colIdx]
+	}
+	find := -1
+	for i := 0; i < len(resolver.colsMap); i++ {
+		if resolver.colsMap[i] == colIdx {
+			find = i
+			break
+		}
+	}
+	if find == -1 || find >= len(row) {
+		panic(fmt.Sprintf("Can't find column[%d] in map %v", colIdx, resolver.colsMap))
+	}
+	return row[find]
+}
+
+func newColumnResolver(colsMap []int) *columnResolver {
+	return &columnResolver{colsMap: colsMap}
+}
+
 type tableReader struct {
-	ctx      context.Context
-	close    context.CancelFunc
-	path     string
-	colsMap  []int
-	chunkIn  chan *chunk
-	chunkOut chan *chunk
+	ctx            context.Context
+	close          context.CancelFunc
+	path           string
+	columnResolver *columnResolver
+	chunkIn        chan *chunk
+	chunkOut       chan *chunk
 }
 
 func newTableReader(ctx context.Context, path string, chunkNum, chunkCap int) *tableReader {
 	tableReader := &tableReader{path: path}
 	tableReader.ctx, tableReader.close = context.WithCancel(ctx)
+	tableReader.columnResolver = newColumnResolver(nil)
 	tableReader.chunkIn = make(chan *chunk, chunkNum)
 	tableReader.chunkOut = make(chan *chunk, chunkNum)
 	for i := 0; i < chunkNum; i++ {
@@ -37,14 +63,14 @@ func (tableReader *tableReader) read() chan *chunk {
 func (tableReader *tableReader) readRow(rawRow []byte, sep byte, chunk *chunk) {
 	if len(rawRow) > 0 {
 		row := bytes.Split(rawRow, []byte{sep})
-		if tableReader.colsMap != nil {
+		if tableReader.columnResolver.colsMap != nil {
 			for i := 0; i < len(row); i++ {
-				for newIdx, oldIdx := range tableReader.colsMap {
+				for newIdx, oldIdx := range tableReader.columnResolver.colsMap {
 					if newIdx != oldIdx {
 						row[newIdx], row[oldIdx] = row[oldIdx], row[newIdx]
 					}
 				}
-				row = row[:len(tableReader.colsMap)]
+				row = row[:len(tableReader.columnResolver.colsMap)]
 			}
 		}
 		chunk.appendRow(row)
@@ -98,18 +124,5 @@ func (tableReader *tableReader) releaseChunk(chunk *chunk) {
 }
 
 func (tableReader *tableReader) getColumn(row [][]byte, colIdx int) []byte {
-	if tableReader.colsMap == nil {
-		return row[colIdx]
-	}
-	find := -1
-	for i := 0; i < len(tableReader.colsMap); i++ {
-		if tableReader.colsMap[i] == colIdx {
-			find = i
-			break
-		}
-	}
-	if find == -1 || find >= len(row) {
-		panic(fmt.Sprintf("Can't find column[%d] in map %v", colIdx, tableReader.colsMap))
-	}
-	return row[find]
+	return tableReader.columnResolver.resolve(row, colIdx)
 }
