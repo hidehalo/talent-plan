@@ -40,8 +40,6 @@ func _sumFunc1(innerIDs []int64, innerTableRows [][][]byte, outerTableRow [][]by
 		}
 		sum += v
 	}
-	fmt.Println("Plus use sum func1", sum)
-
 	return sum
 }
 
@@ -51,8 +49,6 @@ func _sumFunc2(innerIDs []int64, innerTableRows [][][]byte, outerTableRow [][]by
 	if err != nil {
 		panic("Join panic\n" + err.Error())
 	}
-	fmt.Println("Plus use sum func2", uint64(len(innerIDs)), "*", v, "=", uint64(len(innerIDs))*v)
-
 	return uint64(len(innerIDs)) * v
 }
 
@@ -75,13 +71,11 @@ func (worker *probeWorker) probeOneRow(row [][]byte) (rowIDs []int64) {
 	for _, off := range worker.probeCols {
 		keyHash = append(keyHash, worker.outerColumnResolver.resolve(row, off)...)
 	}
-	printRow := make([]string, 0, len(row))
-	for _, c := range row {
-		printRow = append(printRow, string(c))
-	}
-	// fixme: build hashtable时加入了一列ID可能产生了一些问题
-	fmt.Println("Probe row", printRow[0], "use key", keyHash)
+	fmt.Println("Probe use key", string(keyHash))
 	vals = worker.hashtable.Get(keyHash, vals)
+	if len(vals) > 0 {
+		fmt.Println("Hitted")
+	}
 	for _, val := range vals {
 		rowIDs = append(rowIDs, *(*int64)(unsafe.Pointer(&val[0])))
 	}
@@ -112,7 +106,7 @@ func (worker *probeWorker) runStream(innerTableRows [][][]byte, outerTableReader
 			if chunk == nil {
 				return
 			}
-			worker.probeWithSum(innerTableRows, chunk.data)
+			worker.probeWithSum(innerTableRows, chunk.data[:chunk.cursor])
 			outerTableReader.releaseChunk(chunk)
 		}
 	}
@@ -244,12 +238,13 @@ loop:
 			if chunk == nil {
 				break loop
 			}
-			innerTable = append(innerTable, chunk.data...)
-			for _, row := range chunk.data {
+			innerTable = append(innerTable, chunk.data[:chunk.cursor]...)
+			for _, row := range chunk.data[:chunk.cursor] {
 				for _, off := range joiner.innerOn {
 					keyBuffer = append(keyBuffer, joiner.innerTableReader.getColumn(row, off)...)
 				}
 				*(*int64)(unsafe.Pointer(&valBuffer[0])) = id
+				fmt.Println("Put key=", string(keyBuffer), "Val=", id)
 				hashIndex.Put(keyBuffer, valBuffer)
 				keyBuffer = keyBuffer[:0]
 				id++
