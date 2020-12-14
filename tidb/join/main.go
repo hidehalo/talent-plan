@@ -13,7 +13,7 @@ import "context"
 //   sum: sum of relation0.col0 in the final result
 func Join(f0, f1 string, offset0, offset1 []int) (sum uint64) {
 	ctx := context.Background()
-	joiner := newJoiner(ctx)
-	sum = joiner.join(f0, f1, offset0, offset1)
+	joiner := newJoiner(ctx, f0, f1, offset0, offset1)
+	sum = joiner.join()
 	return
 }
