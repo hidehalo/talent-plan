@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/csv"
-	"fmt"
 	"io"
 	"os"
 	"strconv"
@@ -57,7 +56,6 @@ func buildHashTable(data [][]string, offset []int) (hashtable *mvmap.MVMap) {
 			keyBuffer = append(keyBuffer, row[off]...)
 		}
 		*(*int64)(unsafe.Pointer(&valBuffer[0])) = int64(i)
-		fmt.Println("Put key=", string(keyBuffer), "Val=", i)
 		hashtable.Put(keyBuffer, valBuffer)
 		keyBuffer = keyBuffer[:0]
 	}
@@ -70,11 +68,7 @@ func probe(hashtable *mvmap.MVMap, row []string, offset []int) (rowIDs []int64) 
 	for _, off := range offset {
 		keyHash = append(keyHash, row[off]...)
 	}
-	fmt.Println("Probe use key", string(keyHash))
 	vals = hashtable.Get(keyHash, vals)
-	if len(vals) > 0 {
-		fmt.Println("Hitted")
-	}
 	for _, val := range vals {
 		rowIDs = append(rowIDs, *(*int64)(unsafe.Pointer(&val[0])))
 	}

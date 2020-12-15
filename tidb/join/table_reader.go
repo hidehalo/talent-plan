@@ -62,6 +62,10 @@ func (tableReader *tableReader) read() chan *chunk {
 
 func (tableReader *tableReader) readRow(rawRow []byte, sep byte, chunk *chunk) {
 	if len(rawRow) > 0 {
+		// 不知道为什么bufio#Reader.ReadBytes('\n')会把'\n'给读进来...
+		if rawRow[len(rawRow)-1] == '\n' {
+			rawRow = rawRow[:len(rawRow)-1]
+		}
 		row := bytes.Split(rawRow, []byte{sep})
 		if tableReader.columnResolver.colsMap != nil {
 			for i := 0; i < len(row); i++ {
@@ -88,7 +92,6 @@ func (tableReader *tableReader) fetchData() {
 	}
 	defer csvFile.Close()
 	reader := bufio.NewReader(csvFile)
-	var line []byte
 	chunk := tableReader.borrowChunk()
 	for {
 		select {
@@ -99,7 +102,7 @@ func (tableReader *tableReader) fetchData() {
 				tableReader.chunkOut <- chunk
 				chunk = tableReader.borrowChunk()
 			}
-			line, err = reader.ReadBytes('\n')
+			line, err := reader.ReadBytes('\n')
 			if err == io.EOF {
 				tableReader.readRow(line, ',', chunk)
 				tableReader.chunkOut <- chunk
@@ -114,8 +117,7 @@ func (tableReader *tableReader) fetchData() {
 }
 
 func (tableReader *tableReader) borrowChunk() *chunk {
-	chunk := <-tableReader.chunkIn
-	return chunk
+	return <-tableReader.chunkIn
 }
 
 func (tableReader *tableReader) releaseChunk(chunk *chunk) {

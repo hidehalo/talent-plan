@@ -29,3 +29,7 @@ func (chunk *chunk) reset() {
 func (chunk *chunk) isFull() bool {
 	return chunk.cursor >= cap(chunk.data)
 }
+
+func (chunk *chunk) getData() [][][]byte {
+	return chunk.data[:chunk.cursor]
+}

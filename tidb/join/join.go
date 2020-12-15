@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -71,11 +70,7 @@ func (worker *probeWorker) probeOneRow(row [][]byte) (rowIDs []int64) {
 	for _, off := range worker.probeCols {
 		keyHash = append(keyHash, worker.outerColumnResolver.resolve(row, off)...)
 	}
-	fmt.Println("Probe use key", string(keyHash))
 	vals = worker.hashtable.Get(keyHash, vals)
-	if len(vals) > 0 {
-		fmt.Println("Hitted")
-	}
 	for _, val := range vals {
 		rowIDs = append(rowIDs, *(*int64)(unsafe.Pointer(&val[0])))
 	}
@@ -106,7 +101,7 @@ func (worker *probeWorker) runStream(innerTableRows [][][]byte, outerTableReader
 			if chunk == nil {
 				return
 			}
-			worker.probeWithSum(innerTableRows, chunk.data[:chunk.cursor])
+			worker.probeWithSum(innerTableRows, chunk.getData())
 			outerTableReader.releaseChunk(chunk)
 		}
 	}
@@ -127,9 +122,8 @@ func (worker *probeWorker) close() {
 	worker.quit <- struct{}{}
 }
 
-func (worker *probeWorker) getSum() uint64 {
+func (worker *probeWorker) wait() {
 	<-worker.quit
-	return worker.sum
 }
 
 func newProbeWorker(ctx context.Context, hashtable *mvmap.MVMap, innerColResolver, outerColResolver *columnResolver, probeCols []int) *probeWorker {
@@ -178,7 +172,8 @@ func (joiner *hashJoiner) concurrentProbeStreamWithSum(hashtable *mvmap.MVMap, i
 	}
 	var sum uint64
 	for _, w := range probeWorkers {
-		sum += w.getSum()
+		w.wait()
+		sum += w.sum
 	}
 	return sum
 }
@@ -197,7 +192,7 @@ func (joiner *hashJoiner) concurrentProbeSerialWithSum(hashtable *mvmap.MVMap, i
 		)
 		if joiner.selfJoin {
 			worker.sumInner = true
-			worker.sumFunc = _sumFunc2
+			worker.sumFunc = _sumFunc1
 		} else if joiner.optimized {
 			worker.sumInner = false
 			worker.sumFunc = _sumFunc2
@@ -215,7 +210,8 @@ func (joiner *hashJoiner) concurrentProbeSerialWithSum(hashtable *mvmap.MVMap, i
 	}
 	var sum uint64
 	for _, w := range probeWorkers {
-		sum += w.getSum()
+		w.wait()
+		sum += w.sum
 	}
 	return sum
 }
@@ -238,13 +234,12 @@ loop:
 			if chunk == nil {
 				break loop
 			}
-			innerTable = append(innerTable, chunk.data[:chunk.cursor]...)
-			for _, row := range chunk.data[:chunk.cursor] {
+			innerTable = append(innerTable, chunk.getData()...)
+			for _, row := range chunk.getData() {
 				for _, off := range joiner.innerOn {
 					keyBuffer = append(keyBuffer, joiner.innerTableReader.getColumn(row, off)...)
 				}
 				*(*int64)(unsafe.Pointer(&valBuffer[0])) = id
-				fmt.Println("Put key=", string(keyBuffer), "Val=", id)
 				hashIndex.Put(keyBuffer, valBuffer)
 				keyBuffer = keyBuffer[:0]
 				id++
@@ -299,9 +294,9 @@ func (joiner *hashJoiner) join() uint64 {
 func newJoiner(ctx context.Context, innerTablePath, outerTablePath string, innerOffset, outerOffset []int) *hashJoiner {
 	return &hashJoiner{
 		ctx:              ctx,
-		innerTableReader: newTableReader(ctx, innerTablePath, runtime.NumCPU()+1, 500),
+		innerTableReader: newTableReader(ctx, innerTablePath, runtime.NumCPU()+1, 200),
 		innerOn:          innerOffset,
-		outerTableReader: newTableReader(ctx, outerTablePath, runtime.NumCPU()+1, 500),
+		outerTableReader: newTableReader(ctx, outerTablePath, runtime.NumCPU()+1, 200),
 		outerOn:          outerOffset,
 	}
 }
