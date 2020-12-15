@@ -146,11 +146,15 @@ type hashJoiner struct {
 	outerOn          []int
 	optimized        bool
 	selfJoin         bool
+	readEmpty        bool
 }
 
 // 探测关系数据流并返回r0.col0求和结果
 func (joiner *hashJoiner) concurrentProbeStreamWithSum(hashtable *mvmap.MVMap, innerTable [][][]byte) uint64 {
-	concurrency := runtime.NumCPU()
+	// concurrency := runtime.NumCPU()
+	// 这边worker job并发已经起不到什么提升了
+	// 多个worker对chunk的状态是饥饿的
+	concurrency := 1
 	probeWorkers := make([]*probeWorker, 0, concurrency)
 	chunkCh := joiner.outerTableReader.read()
 	for i := 0; i < concurrency; i++ {
@@ -277,10 +281,17 @@ func (joiner *hashJoiner) optimize() {
 		joiner.innerOn, joiner.outerOn = joiner.outerOn, joiner.innerOn
 		joiner.optimized = true
 	}
+	if innerStat.Size() == 0 || outerStat.Size() == 0 {
+		joiner.readEmpty = true
+		joiner.optimized = true
+	}
 }
 
 func (joiner *hashJoiner) join() uint64 {
 	joiner.optimize()
+	if joiner.readEmpty {
+		return uint64(0)
+	}
 	innerTable, hashtable, err := joiner.build()
 	if err != nil {
 		panic(err)
@@ -294,9 +305,9 @@ func (joiner *hashJoiner) join() uint64 {
 func newJoiner(ctx context.Context, innerTablePath, outerTablePath string, innerOffset, outerOffset []int) *hashJoiner {
 	return &hashJoiner{
 		ctx:              ctx,
-		innerTableReader: newTableReader(ctx, innerTablePath, runtime.NumCPU()+1, 200),
+		innerTableReader: newTableReader(ctx, innerTablePath, runtime.NumCPU()*runtime.NumCPU(), 200),
 		innerOn:          innerOffset,
-		outerTableReader: newTableReader(ctx, outerTablePath, runtime.NumCPU()+1, 200),
+		outerTableReader: newTableReader(ctx, outerTablePath, runtime.NumCPU()*runtime.NumCPU(), 200),
 		outerOn:          outerOffset,
 	}
 }
